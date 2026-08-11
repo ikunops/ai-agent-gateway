@@ -15,10 +15,10 @@ class UpstreamClient:
         self.api_key = api_key
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key not in ("", "sk-none"):
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     async def chat_completions(
         self, payload: Dict, stream: bool

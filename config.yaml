@@ -9,10 +9,11 @@ auth:
 upstream:
   # 兼容旧的单分类器配置：gateway.classifiers 未配置时才用它。
   # base_url 留空 = 纯整形模式，不调用任何分类器（技术词+向量两路路由仍完整可用）
+  # 转发模式（/v1/chat/completions）：指向 opencode Zen 免费端点，无需 key
   default:
-    base_url: "https://api.deepseek.com/v1"
-    api_key_env: "DEEPSEEK_API_KEY"
-    default_model: "deepseek-chat"
+    base_url: "https://opencode.ai/zen/v1"
+    api_key_env: ""
+    default_model: "deepseek-v4-flash-free"
 
 gateway:
   # 多分类器交叉验证（推荐）：模型完全由你决定，任意 OpenAI 兼容端点，
