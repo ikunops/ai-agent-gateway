@@ -70,6 +70,10 @@ def client(upstream_url, tmp_path):
             base_url=upstream_url, api_key_env="MOCK_KEY", default_model="deepseek-chat"
         ),
         anchor_prompt="ANCHOR PROTOCOL",
+        routes={
+            "oracle": "关系型数据库集群、高可用架构、存储管理、SQL调优",
+            "generic": "通用问题",
+        },
         audit_dir=str(tmp_path / "logs"),
         data_dir=str(tmp_path / "data"),
     )

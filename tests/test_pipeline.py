@@ -7,6 +7,7 @@ from app.layers.preprocess import clean_messages, normalize_text
 from app.layers.system_builder import (
     build_system,
     extract_dynamic_impurities,
+    is_theoretical_query,
     reorganize_messages,
 )
 
@@ -55,3 +56,50 @@ def test_dynamic_impurity_moved_to_tail():
     out = reorganize_messages(msgs, anchor_prompt="ANCHOR")
     joined = " ".join(m.get("content", "") for m in out)
     assert "[动态信息:" in joined
+
+
+def test_system_role_desensitized_user_untouched():
+    sys_msg = {"role": "system", "content": "当前时间 2026-08-11T09:00:00.123Z"}
+    user_msg = {"role": "user", "content": "查订单 550e8400-e29b-41d4-a716-446655440000 状态"}
+    out = clean_messages([sys_msg, user_msg])
+    assert "[TIMESTAMP]" in out[0]["content"]
+    assert "550e8400-e29b-41d4-a716-446655440000" in out[1]["content"]
+
+
+def test_user_uuid_never_desensitized():
+    user_msg = {"role": "user", "content": "订单 550e8400-e29b-41d4-a716-446655440000 状态如何"}
+    out = clean_messages([user_msg])
+    assert "550e8400-e29b-41d4-a716-446655440000" in out[0]["content"]
+
+
+def test_code_block_preserved():
+    code = "```yaml\nservice:\n    name: app\n    port: 8080\n```"
+    out = clean_messages([{"role": "user", "content": code}])
+    assert "    port: 8080" in out[0]["content"]
+
+
+def test_code_block_spacing_kept():
+    code = "def f():\n    return 1"
+    out = clean_messages([{"role": "user", "content": code}])
+    assert out[0]["content"] == code
+
+
+def test_theoretical_query_detection():
+    msgs = [{"role": "user", "content": "什么是 CAP 定理"}]
+    assert is_theoretical_query(msgs) is True
+    msgs2 = [{"role": "user", "content": "帮我查一下 k8s 节点状态"}]
+    assert is_theoretical_query(msgs2) is False
+
+
+def test_skip_anchor_for_theoretical():
+    msgs = [{"role": "user", "content": "解释一下 CAP 理论"}]
+    out = reorganize_messages(msgs, anchor_prompt="状态优先行动协议...", skip_anchor=True)
+    assert "状态优先行动协议" not in out[0]["content"]
+
+
+def test_system_length_cap():
+    long = "A" * 10000
+    s = build_system(long, "", "", "", max_chars=1000)
+    assert len(s) <= 1000 + 40
+    assert "截断" in s
+

@@ -7,8 +7,9 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import Config, upstream_api_key
-from app.layers.cache import CacheEngine, extract_tech_tags
+from app.layers.cache import CacheEngine
 from app.layers.preprocess import auth_ok, clean_messages, parse_session
+from app.layers.system_builder import is_theoretical_query, reorganize_messages
 from app.layers.response_cache import (
     ResponseCache,
     build_sse_chunks,
@@ -19,7 +20,7 @@ from app.layers.response_cache import (
     stats_snapshot,
 )
 from app.layers.stats import Stats
-from app.layers.system_builder import reorganize_messages
+from app.layers.system_builder import is_theoretical_query, reorganize_messages
 from app.upstream.llm import UpstreamClient
 
 router = APIRouter()
@@ -31,6 +32,8 @@ def _services(request: Request):
         request.app.state.stats,
         request.app.state.cache,
         request.app.state.resp_cache,
+        request.app.state.router,
+        request.app.state.llm_router,
     )
 
 
@@ -47,6 +50,7 @@ def _audit_record(request_id, session, tier, overlap, extra) -> Dict:
         "session_id": session.session_id,
         "tier": tier,
         "prefix_overlap": overlap,
+        "route": extra.pop("route", None) if isinstance(extra, dict) else None,
         "extra": extra,
     }
 
@@ -62,7 +66,7 @@ async def chat_completions(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None),
 ):
-    config, stats, cache, resp_cache = _services(request)
+    config, stats, cache, resp_cache, router, llm_router = _services(request)
 
     key = x_api_key
     if not key and authorization and authorization.lower().startswith("bearer "):
@@ -81,6 +85,8 @@ async def chat_completions(
     session = parse_session(dict(request.headers), messages)
     cleaned = clean_messages(messages)
 
+    theoretical = is_theoretical_query(cleaned)
+
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     upstream = UpstreamClient(config.upstream.base_url, upstream_api_key(config) or "sk-none")
 
@@ -89,22 +95,27 @@ async def chat_completions(
     if cached:
         stats_hit(cached)
         stats.audit.log(_audit_record(request_id, session, None, 0, {"cache": "exact-hit"}))
+        resp_headers = {"X-Gateway-Cache": "HIT", "X-Gateway-Project-Id": session.project_id}
         if stream:
             return StreamingResponse(
                 (_sse_packet(c) for c in build_sse_chunks(cached) + [{"done": True}]),
                 media_type="text/event-stream",
-                headers={"X-Gateway-Cache": "HIT"},
+                headers=resp_headers,
             )
-        return JSONResponse(content=cached, headers={"X-Gateway-Cache": "HIT"})
+        return JSONResponse(content=cached, headers=resp_headers)
 
     stats_miss()
 
     all_text = " ".join(
         m.get("content", "") for m in cleaned if isinstance(m.get("content"), str)
     )
-    tags = extract_tech_tags(all_text)
-    tier, tier_content = cache.resolve(session.project_id, session.session_id, tags)
-    routing_note = f"已匹配项目上下文（Tier{tier}）。" if tier_content else ""
+    route_name, route_score, route_source = await router.route(
+        all_text, llm_judge=llm_router.judge
+    )
+    tier, tier_content = cache.resolve(session.project_id, session.session_id, route_name)
+    routing_note = ""
+    if tier_content:
+        routing_note = f"已匹配项目上下文（Tier{tier}）。" if tier > 1 else f"领域路由[{route_name}]（{route_source}，得分{route_score:.2f}）。"
 
     final_messages = reorganize_messages(
         cleaned,
@@ -112,6 +123,7 @@ async def chat_completions(
         project_context=tier_content,
         session_context="",
         routing_note=routing_note,
+        skip_anchor=theoretical,
     )
     system_text = final_messages[0].get("content", "") if final_messages else ""
     prefix_key = f"{session.project_id}::{session.session_id}::{model}"
@@ -140,8 +152,14 @@ async def chat_completions(
                     session.session_id,
                     make_session_summary(cleaned, _reply_text(data)),
                 )
-                stats.audit.log(_audit_record(request_id, session, tier, overlap, {"cache": "miss"}))
-                return JSONResponse(content=data, headers={"X-Gateway-Cache": "MISS"})
+                stats.audit.log(_audit_record(
+                    request_id, session, tier, overlap,
+                    {"cache": "miss", "route": {"name": route_name, "source": route_source, "score": route_score}},
+                ))
+                return JSONResponse(
+                    content=data,
+                    headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id},
+                )
 
         return await _non_stream()
 
@@ -185,10 +203,15 @@ async def chat_completions(
                 session.session_id,
                 make_session_summary(cleaned, content),
             )
-        stats.audit.log(_audit_record(request_id, session, tier, overlap, {"cache": "miss-stream"}))
+        stats.audit.log(_audit_record(
+            request_id, session, tier, overlap,
+            {"cache": "miss-stream", "route": {"name": route_name, "source": route_source, "score": route_score}},
+        ))
 
     return StreamingResponse(
-        _stream(), media_type="text/event-stream", headers={"X-Gateway-Cache": "MISS"}
+        _stream(),
+        media_type="text/event-stream",
+        headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id},
     )
 
 

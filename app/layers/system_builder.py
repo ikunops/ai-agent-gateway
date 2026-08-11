@@ -34,6 +34,7 @@ def build_system(
     project_context: str,
     session_context: str,
     routing_note: str,
+    max_chars: int = 6000,
 ) -> str:
     parts: List[str] = []
     if anchor_prompt.strip():
@@ -44,7 +45,10 @@ def build_system(
         parts.append(session_context.strip())
     if routing_note.strip():
         parts.append(routing_note.strip())
-    return "\n\n".join(parts)
+    system = "\n\n".join(parts)
+    if max_chars > 0 and len(system) > max_chars:
+        system = system[:max_chars] + "\n\n[注: 项目上下文过长已截断]"
+    return system
 
 
 def _split_system_messages(messages: List[Dict]) -> tuple[List[Dict], str, List[Dict]]:
@@ -60,12 +64,28 @@ def _split_system_messages(messages: List[Dict]) -> tuple[List[Dict], str, List[
     return others, "\n\n".join(system_parts), others
 
 
+_THEORY_KEYWORDS = ("什么是", "解释", "原理", "区别", "为什么", "介绍", "讲讲", "对比", "?")
+
+
+def is_theoretical_query(messages: List[Dict]) -> bool:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = [p.get("text", "") for p in content if isinstance(p, dict)]
+                content = " ".join(parts)
+            lower = str(content).lower()
+            return any(kw in lower for kw in _THEORY_KEYWORDS)
+    return False
+
+
 def reorganize_messages(
     messages: List[Dict],
     anchor_prompt: str,
     project_context: str = "",
     session_context: str = "",
     routing_note: str = "",
+    skip_anchor: bool = False,
 ) -> List[Dict]:
     if not messages:
         return []
@@ -100,7 +120,7 @@ def reorganize_messages(
             rest = rest[: user_idx + 1] + [{"role": "user", "content": tail}] + rest[user_idx + 1 :]
 
     gateway_system = build_system(
-        anchor_prompt, project_context, session_context, routing_note
+        "" if skip_anchor else anchor_prompt, project_context, session_context, routing_note
     )
     full_system = gateway_system
     if system_parts:

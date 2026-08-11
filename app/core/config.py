@@ -21,6 +21,9 @@ class Config(BaseModel):
     upstream: UpstreamConfig
     anchor_prompt: str = ""
     project_agents: Dict[str, str] = {}
+    routes: Dict[str, str] = {}
+    router_threshold: float = 0.55
+    router_cache_ttl: int = 3600
     tier3_max_sessions: int = 200
     audit_dir: str = "logs"
     audit_keep_days: int = 30
@@ -34,6 +37,22 @@ def _deep_get(data: Dict[str, Any], path: str, default: Any = None) -> Any:
             return default
         cur = cur[key]
     return cur
+
+
+def _flatten_routes(raw_routes: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not isinstance(raw_routes, dict):
+        return out
+    for name, val in raw_routes.items():
+        if isinstance(val, dict):
+            desc = val.get("description", "")
+        elif isinstance(val, str):
+            desc = val
+        else:
+            desc = ""
+        if desc:
+            out[name] = desc
+    return out
 
 
 def load_config(path: Path = ROOT / "config.yaml") -> Config:
@@ -54,6 +73,9 @@ def load_config(path: Path = ROOT / "config.yaml") -> Config:
         ),
         anchor_prompt=_deep_get(raw, "gateway.anchor_prompt", ""),
         project_agents=_deep_get(raw, "gateway.project_agents", {}),
+        routes=_flatten_routes(_deep_get(raw, "gateway.routes", {})),
+        router_threshold=float(_deep_get(raw, "gateway.router.vector_threshold", 0.55)),
+        router_cache_ttl=int(_deep_get(raw, "gateway.router.cache_ttl_seconds", 3600)),
         tier3_max_sessions=int(_deep_get(raw, "cache.tier3_max_sessions", 200)),
         audit_dir=_deep_get(raw, "audit.dir", "logs"),
         audit_keep_days=int(_deep_get(raw, "audit.keep_days", 30)),

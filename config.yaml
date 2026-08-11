@@ -25,6 +25,27 @@ gateway:
     - 禁止自动执行数据库 DELETE / DROP（必须人工确认）
     - 浏览器操作禁止调用 browser_close / browser_restart（只允许只读和点击）
 
+  # 路线画像：自然语言描述（可含领域术语，但无需穷举），向量+LLM 按语义匹配
+  routes:
+    java:
+      description: "Java/JVM生态：JVM内存模型、OOM、堆外内存、并发编程、Maven/Gradle构建、Spring生态、性能调优"
+    oracle:
+      description: "Oracle数据库：关系型数据库集群、RAC高可用、ASM存储管理、SQL调优、备份恢复、数据泵、分区、AWR"
+    mysql:
+      description: "MySQL数据库：InnoDB、主从复制、binlog、慢查询、索引优化、锁、GTID、半同步复制"
+    kubernetes:
+      description: "Kubernetes/K8s：容器编排、Pod调度、CrashLoopBackOff、服务网格、云原生基础设施、Helm、节点资源管理"
+    linux:
+      description: "Linux操作系统：进程管理、文件系统、网络配置、Shell脚本、系统服务、内核参数"
+    network:
+      description: "网络：网络协议、路由交换、负载均衡、防火墙、DNS、网络故障排查、连通性"
+    generic:
+      description: "通用问题、编程语言语法、日常IT咨询、与具体技术栈无关的问题"
+
+  router:
+    vector_threshold: 0.55
+    cache_ttl_seconds: 3600
+
   project_agents: {}
 
 cache:

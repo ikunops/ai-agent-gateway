@@ -16,7 +16,13 @@ class _SafeCounter:
         day = time.strftime("%Y-%m-%d", time.localtime())
         dkey = f"{day}::{key}"
         if dkey not in self.data:
-            self.data[dkey] = {"requests": 0, "tokens": 0, "hit_bytes": 0, "total_prefix": 0}
+            self.data[dkey] = {
+                "requests": 0,
+                "tokens": 0,
+                "hit_bytes": 0,
+                "total_prefix": 0,
+                "saved_tokens": 0,
+            }
         return self.data[dkey]
 
     def inc(self, key: str, **fields) -> None:
@@ -68,6 +74,11 @@ class Stats:
     def record_route(self, request_id: str, project_id: str, session_id: str, tier: int) -> None:
         self.counter.inc("routes", tier=tier if tier else 0, requests=1)
         self.counter.inc(f"tier{tier}", requests=1)
+
+    def record_saved(self, saved_chars: int = 0, saved_tokens: int = 0) -> None:
+        self.counter.inc("savings", saved_tokens=saved_tokens, requests=1)
+        if saved_chars:
+            self.counter.inc("savings", hit_bytes=saved_chars)
 
     def record_prefix(self, key: str, current: str) -> int:
         prev = self._prefix_history.get(key, "")

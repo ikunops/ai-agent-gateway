@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import threading
@@ -61,6 +62,12 @@ class ProjectRegistry:
             candidate = p / "AGENTS.md"
             return candidate if candidate.is_file() else None
         return None
+
+    def fingerprint(self, project_id: str) -> str:
+        entry = self.get(project_id)
+        base = entry.get("agents_path", "") if entry else ""
+        digest = hashlib.sha256(f"{project_id}:{base}".encode("utf-8")).hexdigest()[:8]
+        return f"{project_id}::{digest}"
 
     def all(self) -> Dict:
         with self._lock:

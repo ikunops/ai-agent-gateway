@@ -4,11 +4,13 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from app.api.chat import router as chat_router
-from app.core.config import Config, load_config
+from app.core.config import Config, load_config, upstream_api_key
 from app.layers.cache import CacheEngine
 from app.layers.registry import ProjectRegistry
 from app.layers.response_cache import ResponseCache, stats_snapshot
+from app.layers.router import SemanticRouter
 from app.layers.stats import Stats
+from app.upstream.llm_router import LLMRouter
 
 
 class ProjectBody(BaseModel):
@@ -18,13 +20,22 @@ class ProjectBody(BaseModel):
 
 
 def create_app(config: Config) -> FastAPI:
-    app = FastAPI(title="AI Gateway", version="0.2.0")
+    app = FastAPI(title="AI Gateway", version="0.3.0")
     app.state.config = config
     app.state.stats = Stats(config.audit_dir, config.audit_keep_days)
     app.state.cache = CacheEngine(project_root=None, max_sessions=config.tier3_max_sessions)
     app.state.registry = ProjectRegistry(str(Path(config.data_dir) / "projects.json"))
     app.state.cache.bind_registry(app.state.registry)
+    app.state.cache.set_route_profiles(config.routes)
     app.state.resp_cache = ResponseCache(str(Path(config.data_dir) / "resp_cache"))
+    app.state.router = SemanticRouter(
+        config.routes,
+        threshold=config.router_threshold,
+        cache_ttl=config.router_cache_ttl,
+    )
+    app.state.llm_router = LLMRouter(
+        config.upstream.base_url, upstream_api_key(config) or "", config.upstream.default_model
+    )
     app.include_router(chat_router)
 
     @app.get("/v1/health")
