@@ -13,16 +13,27 @@ class LLMRouter:
         self.api_key = api_key
         self.model = model
 
-    async def judge(self, text: str, route_names: List[str]) -> Optional[str]:
+    async def judge(
+        self, text: str, route_names: List[str], context: str = ""
+    ) -> Optional[str]:
         if not self.api_key or not route_names:
             return None
         routes = ", ".join(route_names)
         prompt = (
             f"你有以下路线：{routes}。\n"
             f"用户问题：\"{text[:500]}\"\n"
+        )
+        if context.strip():
+            prompt += (
+                f"对话上下文（用户之前讨论的内容，用于判断语境，优先级最高）："
+                f"\"{context[-800:]}\"\n"
+            )
+        prompt += (
             f"规则：\n"
-            f"1. 若问题包含\"什么是/解释/原理/区别/为什么/介绍/讲讲/对比/？\"等理论性问法，优先选择 generic。\n"
-            f"2. 否则根据问题涉及的技术领域选择最匹配的一条路线。\n"
+            f"1. 如果提供了对话上下文，必须优先依据上下文判断技术语境，把上下文中最突出的技术领域作为路线。\n"
+            f"   例如：上下文在讨论 MySQL/数据库问题，则\"分布式事务\"应选 mysql；上下文在讨论 Spring/JVM，则应选 java。\n"
+            f"2. 仅在没有任何上下文时，理论性问题（什么是/解释/原理）才选 generic。\n"
+            f"3. 否则根据问题涉及的技术领域选择最匹配的一条路线。\n"
             f"请只输出最匹配的一条路线名，不要输出其他内容。"
         )
         payload = {

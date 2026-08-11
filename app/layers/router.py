@@ -186,9 +186,13 @@ class SemanticRouter:
         self,
         text: str,
         llm_judge=None,
+        context: str = "",
     ) -> Tuple[str, float, str]:
         """返回 (route_name, score, source)。source: cache/vector/llm/fallback"""
-        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        key_src = text
+        if context.strip():
+            key_src = f"{text}\n<ctx>{context[-800:]}</ctx>"
+        key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()
 
         hit = self._cache_get(key)
         if hit:
@@ -201,7 +205,7 @@ class SemanticRouter:
             return name, score, "vector"
 
         if llm_judge is not None:
-            name = await llm_judge(text, list(self.profiles.keys()))
+            name = await llm_judge(text, list(self.profiles.keys()), context=context)
             if name and name in self.profiles:
                 self._cache_set(key, name, 1.0, "llm")
                 return name, 1.0, "llm"

@@ -109,8 +109,13 @@ async def chat_completions(
     all_text = " ".join(
         m.get("content", "") for m in cleaned if isinstance(m.get("content"), str)
     )
+    context_text = "\n".join(
+        f"{m.get('role')}: {str(m.get('content', ''))[:300]}"
+        for m in cleaned[-6:-1]
+        if isinstance(m.get("content"), str)
+    )
     route_name, route_score, route_source = await router.route(
-        all_text, llm_judge=llm_router.judge
+        all_text, llm_judge=llm_router.judge, context=context_text
     )
     tier, tier_content = cache.resolve(session.project_id, session.session_id, route_name)
     routing_note = ""
