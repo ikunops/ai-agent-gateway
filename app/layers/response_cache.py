@@ -180,10 +180,26 @@ def make_session_summary(messages: List[Dict], reply_content: str, max_chars: in
         if m.get("role") == "user":
             c = m.get("content")
             if isinstance(c, str) and c.strip():
-                first_line = c.strip().split("\n")[0][:120]
-                user_lines.append(first_line)
+                user_lines.append(_first_meaningful_line(c))
     summary = f"用户最近请求: {' | '.join(user_lines[-5:])}\n" if user_lines else ""
     if reply_content:
         reply = reply_content.strip().split("\n")[0][:200]
         summary += f"最后回复摘要: {reply}"
     return summary[:max_chars]
+
+
+_FILLER_LINE_RE = re.compile(
+    r"^(你好|您好|嗨|hi|hello|谢谢|感谢|麻烦|辛苦了|帮帮忙|好的|可以|嗯|ok|请问|打扰)"
+    r"[，。,.!！\s]*$",
+    re.I,
+)
+
+
+def _first_meaningful_line(text: str) -> str:
+    """取首个非寒暄行（长文本首行常是问候语，跳过）。"""
+    lines = text.strip().split("\n")
+    for line in lines:
+        s = line.strip()
+        if s and not _FILLER_LINE_RE.match(s):
+            return s[:120]
+    return (lines[0] if lines else "")[:120]

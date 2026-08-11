@@ -37,6 +37,35 @@ def test_tier3_session_remember():
     assert tier == 3 and "历史摘要" in content
 
 
+def test_tier1_merges_session_summary():
+    cache = CacheEngine(project_root=None, max_sessions=10)
+    cache.set_route_profiles({"java": "处理JVM内存模型"})
+    cache.remember("p", "s", "用户已确认要排查JVM堆外内存")
+    tier, content = cache.resolve("p", "s", "java")
+    assert tier == 1
+    assert "处理JVM内存模型" in content
+    assert "会话历史摘要" in content
+    assert "排查JVM堆外内存" in content
+
+
+def test_tier2_merges_session_summary(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("项目规范: 禁止删除Pod", encoding="utf-8")
+    cache = CacheEngine(project_root=tmp_path, max_sessions=10)
+    cache.remember("proj", "sess", "已讨论过PVC扩容方案")
+    tier, content = cache.resolve("proj", "sess", "")
+    assert tier == 2
+    assert "禁止删除Pod" in content
+    assert "PVC扩容方案" in content
+
+
+def test_clarified_one_shot_flag():
+    cache = CacheEngine(project_root=None, max_sessions=10)
+    assert not cache.already_clarified("p", "s")
+    cache.mark_clarified("p", "s")
+    assert cache.already_clarified("p", "s")
+    assert not cache.already_clarified("p", "other")
+
+
 def test_stats_prefix_overlap(tmp_path):
     stats = Stats(str(tmp_path), 30)
     a = "A" * 100 + "B" * 50

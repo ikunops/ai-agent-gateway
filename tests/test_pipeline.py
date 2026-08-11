@@ -8,6 +8,7 @@ from app.layers.system_builder import (
     build_system,
     extract_dynamic_impurities,
     is_theoretical_query,
+    is_vague_development_request,
     reorganize_messages,
 )
 
@@ -102,4 +103,81 @@ def test_system_length_cap():
     s = build_system(long, "", "", "", max_chars=1000)
     assert len(s) <= 1000 + 40
     assert "截断" in s
+
+
+def test_vague_detection_positive():
+    msgs = [{"role": "user", "content": "开发一个手机清理工具"}]
+    assert is_vague_development_request(msgs) is True
+    assert is_vague_development_request([{"role": "user", "content": "帮我写一个手机清理工具"}]) is True
+    assert is_vague_development_request([{"role": "user", "content": "想搭一个监控面板"}]) is True
+
+
+def test_vague_detection_with_tech_word_negative():
+    assert is_vague_development_request([{"role": "user", "content": "用python写一个清理工具"}]) is False
+    assert is_vague_development_request([{"role": "user", "content": "帮我写一个web工具"}]) is False
+
+
+def test_vague_detection_negation():
+    assert is_vague_development_request([{"role": "user", "content": "不需要开发手机清理工具"}]) is False
+    assert is_vague_development_request([{"role": "user", "content": "别实现这个功能"}]) is False
+
+
+def test_vague_detection_theoretical_excluded():
+    assert is_vague_development_request([{"role": "user", "content": "解释一下怎么开发一个手机清理工具"}]) is False
+
+
+def test_vague_detection_long_text_negative():
+    long_text = "开发一个手机清理工具，" + "我们需要先分析需求，然后设计架构，接着写代码。" * 5
+    assert is_vague_development_request([{"role": "user", "content": long_text}]) is False
+
+
+def test_vague_detection_last_message_only():
+    msgs = [
+        {"role": "user", "content": "开发一个手机清理工具"},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "用 python 写吧"},
+    ]
+    assert is_vague_development_request(msgs) is False
+
+
+def test_vague_detection_list_content():
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "开发一个手机清理工具"}]}]
+    assert is_vague_development_request(msgs) is True
+
+
+def test_clarification_hint_appended_to_user_tail():
+    msgs = [{"role": "user", "content": "开发一个手机清理工具"}]
+    out = reorganize_messages(
+        msgs,
+        anchor_prompt="ANCHOR",
+        skip_anchor=True,
+        clarification_hint="[需求澄清模式]\n请先输出澄清问题",
+    )
+    assert out[0]["content"] == "ANCHOR" or "需求澄清模式" not in out[0]["content"]
+    last = out[-1]["content"]
+    assert "[需求澄清模式]" in last
+    assert last.startswith("开发一个手机清理工具")
+
+
+def test_clarification_hint_only_last_user_message():
+    msgs = [
+        {"role": "user", "content": "第一个问题"},
+        {"role": "assistant", "content": "回答"},
+        {"role": "user", "content": "开发一个手机清理工具"},
+    ]
+    out = reorganize_messages(msgs, anchor_prompt="ANCHOR", clarification_hint="HINT")
+    assert "HINT" in out[-1]["content"]
+    assert "HINT" not in out[1]["content"]
+
+
+def test_impurities_capped():
+    text = " ".join(f"2026-08-11T09:00:{i:02d}Z" for i in range(100))
+    _, found = extract_dynamic_impurities(text)
+    assert len(found) == 20
+
+
+def test_impurities_deduped():
+    text = "2026-08-11T09:00:00Z and 2026-08-11T09:00:00Z again"
+    _, found = extract_dynamic_impurities(text)
+    assert len(found) == 1
 

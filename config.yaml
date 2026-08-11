@@ -7,12 +7,58 @@ auth:
     default: "gateway-dev-key"
 
 upstream:
+  # 兼容旧的单分类器配置：gateway.classifiers 未配置时才用它。
+  # base_url 留空 = 纯整形模式，不调用任何分类器（技术词+向量两路路由仍完整可用）
   default:
     base_url: "https://api.deepseek.com/v1"
     api_key_env: "DEEPSEEK_API_KEY"
     default_model: "deepseek-chat"
 
 gateway:
+  # 多分类器交叉验证（推荐）：模型完全由你决定，任意 OpenAI 兼容端点，
+  # 本地免费（Ollama）/云端（DeepSeek、中转站、自建）混用，密钥可空。
+  # 网关并发调用全部分类器 → 加权投票 → 一致性(agreement)作为路由得分。
+  classifiers:
+    # opencode Zen free 模型交叉验证：全部免 API key，OpenAI 兼容端点
+    # https://opencode.ai/zen/v1
+    # 实测仅以下 3 个能遵守"只输出路线名"指令（2026-08-12 验证）：
+    # deepseek / longcat / laguna 对 oracle/mysql/k8s/java/network/generic 全部判对。
+    - name: deepseek-free
+      base_url: "https://opencode.ai/zen/v1"
+      model: "deepseek-v4-flash-free"
+      api_key_env: ""
+      weight: 1.0
+    - name: longcat-free
+      base_url: "https://opencode.ai/zen/v1"
+      model: "longcat-2.0-free"
+      api_key_env: ""
+      weight: 1.0
+    - name: laguna-free
+      base_url: "https://opencode.ai/zen/v1"
+      model: "laguna-s-2.1-free"
+      api_key_env: ""
+      weight: 1.0
+    # 无效模型（保留作记录，勿启用）：
+    # - mimo-v2.5-free / ling-3.0-tiny-free：聊天型，不遵守路由指令，输出长篇→弃权且浪费延迟
+    # - nemotron-3.5-lightning-free：所有输入都固定投 java（错投），会拉低 agreement
+  # 示例（混用本地 + 云端交叉验证）：
+  # classifiers:
+  #   - name: qwen-local          # 本地免费，免密钥
+  #     base_url: "http://127.0.0.1:11434/v1"
+  #     model: "qwen2.5:7b"
+  #     api_key_env: ""
+  #     weight: 1.0
+  #   - name: glm-local
+  #     base_url: "http://127.0.0.1:11434/v1"
+  #     model: "glm4:9b"
+  #     api_key_env: ""
+  #     weight: 1.0
+  #   - name: deepseek-cloud
+  #     base_url: "https://api.deepseek.com/v1"
+  #     model: "deepseek-chat"
+  #     api_key_env: "DEEPSEEK_API_KEY"
+  #     weight: 1.5               # 云端权重可设更高，平票时胜出
+
   anchor_prompt: |
     [项目家风 - 状态优先行动协议]（最高优先级，覆盖其他所有规则）
     1. 任何任务第一步必须用只读工具获取状态（read/ls/grep/webfetch/状态查询），禁止不侦察就下结论或拒绝。
@@ -24,6 +70,17 @@ gateway:
     - 禁止在未明确指定环境的情况下修改 /etc/ 或 ~/.ssh/ 目录
     - 禁止自动执行数据库 DELETE / DROP（必须人工确认）
     - 浏览器操作禁止调用 browser_close / browser_restart（只允许只读和点击）
+
+  # 需求澄清模式：模糊开发需求（如"开发一个手机清理工具"）触发时注入到 User 尾部，
+  # 每会话最多一轮；可在此自定义澄清问题。
+  clarify_prompt: |
+    [需求澄清模式]
+    用户提出了开放式开发需求，但未指定平台和技术栈。
+    本次回复请先输出四个精准的澄清问题，不要直接给出实现方案：
+    1. 目标平台（Android/iOS/Web/桌面）？
+    2. 核心痛点（缓存清理/卸载残留/重复文件/隐私清理）？
+    3. 目标用户（个人使用/企业分发/公开上架）？
+    4. 现有代码库还是从零开始？
 
   # 路线画像：自然语言描述（可含领域术语，但无需穷举），向量+LLM 按语义匹配
   routes:
@@ -48,9 +105,24 @@ gateway:
 
   project_agents: {}
 
+# 本地免费模型（Ollama）做"抽取式"路由摘要：只选原文段落编号，禁止改写。
+# 摘要仅影响路由决策，转发给上游的原文永远不变。
+# 默认关闭；开启后路由慢路径先用本地模型选段，再经保真闸门（否定词/连接词/符号段强制保留）+ 幻觉校验。
+digest:
+  local_picker:
+    enabled: false
+    base_url: "http://127.0.0.1:11434"
+    model: "qwen2.5:7b"
+    max_segments: 4
+
 cache:
   tier3_max_sessions: 200
   stats_window_hours: 24
+
+security:
+  # 三级行动权限（可用请求头 x-permission-level 覆盖）
+  # L0 侦察兵：只读；L1 执行员：读写但拦截高危指令；L2 指挥官：高危放行但需二次确认
+  default_level: L1
 
 data:
   dir: "data"

@@ -1,6 +1,6 @@
 # AI Gateway 架构设计文档
 
-> 版本：v0.3 · 状态：Phase 1 + Phase 2 已实现，Phase 3 设计待评审
+> 版本：v0.5 · 状态：Phase 1-3 已实现（三路路由 + 免费模型交叉验证 + 权限分级拦截），Phase 4 部分完成（统计/审计/项目注册），待确认 #8 已解决
 > 技术栈：Python 3.11 + FastAPI · 定位：LLM API 代理层（独立项目）
 
 ---
@@ -9,22 +9,26 @@
 
 ### 1.1 一句话定位
 
-**AI Gateway 是 Agent 与 LLM 之间的路由导航层**：位于中间，把 Agent 的请求路由导航到合适的模型，通过"System 前缀稳定化 + 缓存降级 + 路由仲裁"提升命中率、降低延迟和成本。它不思考、不记忆、不执行——只做导航指引。
+**AI Gateway 是 Agent 与 LLM 之间的路由导航层**：位于中间，把 Agent 的请求清洗、增强、路由、构造 System 前缀，提升命中率、降低延迟和成本。它不思考、不记忆、不执行——只做导航指引。
+
+**主形态是纯整形（refine）**：网关**不持有任何模型 key、不选模型、不替模型回复**。`POST /v1/refine` 返回"增强后的请求 + 路由元信息"，由 Agent 侧（opencodego）把 `refined.messages` 转发给用户当前选择的模型（用户切换模型只影响 Agent 侧，网关无感知）。转发模式（`/v1/chat/completions` 直连上游）仅作为可选形态保留。
 
 ### 1.2 位置与可插拔性（通用形态）
 
 ```
-┌─────────────┐      OpenAI 兼容 API       ┌──────────────┐      上游调用       ┌──────────────┐
-│  Agent 侧   │ ────────────────────────► │  AI Gateway  │ ────────────────► │  LLM 侧      │
-│  (可插拔)    │  POST /v1/chat/completions │  (本项目)     │   转发             │  (可插拔)     │
-└─────────────┘                           └──────────────┘                    └──────────────┘
-   opencode / 其他 Agent                  仅做路由导航指引                    DeepSeek / 其他模型
+┌─────────────┐   原始请求   ┌──────────────┐   增强后的请求    ┌──────────────┐
+│  Agent 侧   │ ──────────► │  AI Gateway  │ ──────────────► │  Agent 侧     │
+│ (opencodego)│             │  (本项目)     │   refined.messages│ (同侧转发)    │
+└─────────────┘             └──────────────┘                  └──────┬───────┘
+                                                                    │ 用户当前选择的模型
+                                                                    ▼
+                                                             goapi / DeepSeek / 任何模型
 ```
 
 **两端都是可插拔的：**
-- **Agent 侧**：首个接入实例是 opencode（配 `base_url` 指向网关即可，客户端零改动）；未来可以是任何 Agent——接口形态都是 OpenAI 兼容
-- **LLM 侧**：首期对接 DeepSeek；未来任何模型（OpenAI / Claude / 本地模型）——只需新增一个 upstream 配置
-- **网关自身**：只负责中间的路由、导航、指引，不绑定任何一端
+- **Agent 侧**：首个接入实例是 opencodego——先调 `/v1/refine` 拿增强后的请求，再把 `refined.messages` 发给用户当前选择的模型；未来可以是任何 Agent
+- **LLM 侧**：网关不绑定任何模型——用户切换到哪个模型，opencodego 就把增强内容发给哪个模型（goapi / DeepSeek / 本地模型均可）
+- **网关自身**：只负责中间的路由、导航、指引，不持有任何模型 key
 
 ### 1.3 它不是什么（边界红线）
 
@@ -76,6 +80,7 @@
 3. **前缀稳定是第一优先**：System 前缀越稳定，模型侧缓存命中率越高（本网关存在的最大理由）
 4. **永不落空**：四层缓存降级保证任何请求都能构造出可用的 System
 5. **可独立演进**：第一版自研，未来可替换为 APISIX/Kong/Envoy AI Gateway，两端都不需要修改
+6. **渐进式约束（先理解、后约束）**：先做最小范围的意图识别，再根据意图决定注入哪些规则，防止过早的精确性扼杀大模型的解决方案空间。实例：理论问题跳过行动协议锚点（skip_anchor）；模糊开发需求进入澄清模式并跳过全部技术栈注入
 
 ---
 
@@ -144,6 +149,85 @@ sequenceDiagram
 - 知识库缺失时降级为"向量 + LLM"双路仲裁
 - 仲裁器是纯规则加权，可独立替换
 
+**快/中/慢三档（v0.4 实际实现顺序）：**
+
+| 档位 | 路径 | 成本 | 说明 |
+|---|---|---|---|
+| 快 | 技术词直配（`route_name_from_terms`） | 0 LLM | 跨段并集提取技术词（mysql/java/k8s…），词→路由别名直接定标签 |
+| 中 | 语义向量（TF-IDF n-gram / fastembed） | 本地 | **逐段匹配取 max**，防止长文本信号被稀释 |
+| 慢 | LLM 分类器（可多路交叉验证） | 用户自定 | 输入为"路由摘要"而非原文：首段 + 技术词所在段 + 末段 |
+
+**多分类器交叉验证（ClassifierEnsemble）**：分类器端点由用户自定（`gateway.classifiers`，任意 OpenAI 兼容端点——Ollama 本地免费免密钥 / DeepSeek / 中转站），网关**不绑定任何模型厂商**。配置多个时：
+- 并发调用全部分类器（`asyncio.gather`），各自独立超时，失败不计票
+- 按权重加权投票：`votes[路线] += weight`；全部一致 → agreement=1.0，不一致 → 票高者胜，`agreement = 得票权重占比`（即路由得分随一致性下降，路由决策留痕可见）
+- 全部失败 → None，自然降级（技术词/向量路径不受影响）
+- 未配 classifiers 时回退 `upstream.default` 单分类器；都没有则纯本地规则路由
+- 密钥可空（空则不带 Authorization 头），本地模型与中转站通常不校验
+
+**长文本分段路由**：请求先按换行切段（`split_segments`，过滤寒暄/废话段），技术词从**所有段**并集提取——关键信息在第 3 段也能命中；向量逐段打分取最高；LLM 分类器只读路由摘要（≤500 字符），替代旧版"前 500 字符"（关键信息在后段时必然判错）。多领域长文 v1 取最高分单一标签，top-k 多标签留作后续。
+
+**复制粘贴型长文本（墙式文本）处理**：
+- 无换行的超长单段（≥300 字符）按**句子边界二次切分**（。！？；!?;），无句读的纯日志按定长切块 → 向量信号不再被稀释
+- 意图可能在中间段且无技术词 → **向量得分最高的段（best_segment）并入路由摘要**，不再只靠"首段+末段"
+- 技术词快路径永远扫描全量原文（不依赖分段），最坏情况由 LLM 分类器兜底，转发上游的原文永远不变
+
+**摘要的保真契约（防歧义丢失）★**：
+- **摘要只影响路由决策，转发给上游的原文永远不变**——摘要出错的最坏结果是路由标签/Tier1 画像偏差，模型仍能看到全文，风险有界
+- **抽取式而非生成式**：模型只允许"选原文段"，禁止改写——"不用 MySQL"里的"不用"只要在选中的段内就逐字保留
+- **保真闸门（确定性规则）**：`apply_fidelity_guards` 强制把含**否定词**（不/没/别/非/禁/不要…）、**连接词**（和/与/或者/以及…）、**关键符号**（&&/||/=>/::/!=）的段并入摘要——即使模型没选它们
+- **幻觉校验**：外部模型返回的段必须逐字等于原文段（`s in segs`），否则整体弃用，回退确定性路径（技术词段+首段+末段+闸门）
+- **可插拔本地模型**：`digest.local_picker`（Ollama 等，默认关闭）做抽取式选段，失败/超时/不可用自动降级，零风险开启
+
+### 4.2.1 需求澄清模式（模糊开发需求）★
+
+**触发**：`is_vague_development_request` —— 最后一条 user 消息含开发动词（开发/做一个/帮我写/写一个…）、**无任何技术栈词**、未否定（"不需要开发"）、≤60 字符（长文本自带规格）、非理论问题（"什么是…"不触发）。
+
+**处理路径**（检测于 L2 之前，节省分类器调用）：
+
+```
+"开发一个手机清理工具"
+   │ 检测通过（无技术词 + 开发动词 + 短文本）
+   ▼
+跳过整个 L2 路由（不调向量/不调 LLM 分类器，省成本）
+   ▼
+强制 Tier4（零技术栈注入——技术栈正是要问的目标，提前注入会带偏模型）
+   ▼
+skip_anchor（状态优先协议对"提问环节"无意义）
+   ▼
+澄清提示词注入 User 尾部（非 System！）：
+   - System 前缀保持稳定 → 不破坏模型侧缓存命中
+   - 每轮自然失效 = 天然 one-shot
+   ▼
+模型输出 4 个澄清问题（平台/痛点/用户/从零开始）
+   ▼
+用户回答 → 下一轮含平台信息 → 命中技术词快路径或 Tier3 会话摘要 → 正常落地
+```
+
+**关键约束**：
+- **每会话最多一轮**：用户回答"随便"（仍无技术词）不会无限追问——`CacheEngine.mark_clarified` 做会话级标记，第二轮起走正常路由
+- 澄清提示词配置化（`config.yaml` 的 `gateway.clarify_prompt`），可自定义问题
+- 审计记录 `clarify: true`，统计含 clarify 计数（可观测拦截效果）
+
+### 4.2.2 路由观测（Routing Ledger）★
+
+路由是"经验系统"，运行一段时间后必须能回看决策质量才能调优（阈值/词表/画像）。每次路由决策写入明细账：
+
+```
+logs/routing/routing-YYYY-MM-DD.jsonl（每日轮转，与审计同保留周期）
+字段：ts / request_id / project_id / session_id / text_len / segments /
+      terms（命中的技术词）/ source（cache|term|vector|llm|fallback|clarify-skip）/
+      route / score / tier / clarify / digest_len / fidelity_forced /
+      vector_latency_ms / judge_latency_ms / vector_scores（各画像最高分段得分 top3）
+```
+
+**调优入口 `GET /v1/stats/routing`** 返回聚合：
+- `by_source`：决策来源分布——term 占比过高说明词表命中多（可精简），fallback/llm 占比过高说明词表或画像要扩充
+- `top_terms`：真实流量高频技术词——与词表对照，缺的补进 `TECH_TERMS`
+- `avg_vector_latency_ms` / `avg_judge_latency_ms`：成本与延迟画像（判断是否值得开本地抽取模型）
+- `avg_fidelity_forced`：保真闸门平均挽回段数——若持续为 0 说明闸门从未触发，可检查 `_FIDELITY_RE` 覆盖面
+
+审计（audit JSONL）管"合规谁问了什么"，Ledger 管"路由选得准不准"，二者互补。
+
 ### 4.3 L3 缓存降级层（四层回退，永不落空）
 
 | Tier | 名称 | Key | 内容来源 | 命中条件 |
@@ -181,13 +265,13 @@ sequenceDiagram
 
 ### 4.5 权限体系（三级行动权限）
 
-> 网关本身只转发请求不执行操作，此权限体系面向的是**后续可能的工具代理模式**（如网关代客户端执行工具），当前阶段仅注入"状态优先行动协议"作为 System 家风。
+> 网关本身只转发请求不执行操作，指令级**危险扫描拦截**面向转发链路：识别用户消息中的高危指令（rm -rf / DROP / format / shutdown / kill -9 等），按权限等级决定 allow / confirm / block。等级默认 L1（config `security.default_level`），可用请求头 `x-permission-level` 覆盖。实现在 `app/layers/permissions.py`，拦截结果写入 Routing Ledger 与响应头 `X-Gateway-Permission*`。
 
 | 等级 | 适用场景 | 可调用工具 | 禁止行为 | 网关动作 |
 |---|---|---|---|---|
-| L0 侦察兵 | "看看/查一下/读一下" | 只读：read_file、ls、grep、browser_get_url | 写入、删除、重启、网络请求 | 工具列表只传 read_*/list_* |
-| L1 执行员 | "改配置/跑测试" | 读写：write_file、run_test | rm -rf、kill -9、改内核 | 排除高危工具 |
-| L2 指挥官 | "部署/迁移" | 全量，但高危需 --confirm | 无 | 出口拦截 → 请求二次确认 |
+| L0 侦察兵 | "看看/查一下/读一下" | 只读：read_file、ls、grep、browser_get_url | 写入、删除、重启、网络请求 | 高危指令 → block（拦截） |
+| L1 执行员 | "改配置/跑测试" | 读写：write_file、run_test | rm -rf、kill -9、改内核 | 高危指令 → block（拦截） |
+| L2 指挥官 | "部署/迁移" | 全量，但高危需 --confirm | 无 | 高危指令 → confirm（放行+二次确认） |
 
 ### 4.5.1 状态优先行动协议（State-First Protocol）★
 
@@ -260,11 +344,13 @@ sequenceDiagram
 
 ## 5. API 接口草案（v1）
 
-**对外（opencode 对接，OpenAI 兼容）：**
+**对外（opencodego 对接）：**
 
 ```
-POST /v1/chat/completions        # 主代理接口（opencode 直接调用）
-GET  /v1/models                  # 模型列表（可选）
+POST /v1/refine                 # ★主端点：请求整形（清洗/路由/System 构造），零模型依赖
+                                #   返回 refined.messages + meta（路由/Tier/澄清/保真统计）
+POST /v1/chat/completions       # 可选转发模式（需配置 upstream.base_url 才可用）
+GET  /v1/models                 # 模型列表（整形模式返回空，模型由 Agent 侧决定）
 ```
 
 **管理接口：**
@@ -273,6 +359,7 @@ GET  /v1/models                  # 模型列表（可选）
 POST /v1/projects                # 注册项目（绑定 AGENTS.md 路径）
 POST /v1/sessions                # 创建会话
 GET  /v1/stats/hits              # 命中率统计
+GET  /v1/stats/routing           # 路由决策明细账摘要（来源/Tier/词频/延迟，调优入口）
 GET  /v1/audit?client_id=        # 审计查询
 GET  /v1/health                  # 健康检查
 ```
@@ -355,17 +442,19 @@ ai-gateway/
 |---|---|---|---|
 | **Phase 1**（MVP） | OpenAI 兼容转发 + 鉴权 + 状态优先协议注入 + 会话管理 | opencode 能通过网关对话，命中率可见 | ✅ 已实现 |
 | **Phase 2** | 精确响应缓存 + 四层缓存降级 + System 前缀稳定化 + 动态杂质剥离 + 项目注册 + 会话摘要回填 | 命中率明显提升（成本/延迟下降） | ✅ 已实现 |
-| **Phase 3** | 三路路由仲裁 + 模型选择（轻/重） | 简单问题走轻量模型，成本优化 | ⏳ 计划 |
-| **Phase 4** | 统计/审计完善 + 项目注册 API + 权限分级 | 可观测、可治理 | ⏳ 计划 |
+| **Phase 3** | 三路路由仲裁 + 模型选择（轻/重） | 简单问题走轻量模型，成本优化 | ✅ 已实现 |
+| **Phase 4** | 统计/审计完善 + 项目注册 API + 权限分级 | 可观测、可治理 | 🟡 部分（统计/审计/项目注册完成，限流未做） |
 
 ---
 
 ## 8. 待确认问题（评审时讨论）
 
-1. 命中率如何量化展示：上报 DeepSeek 的 `prompt_cache_hit_tokens` vs 网关自算公共前缀长度？
-2. 会话/项目 ID 从哪来：请求头注入 vs opencode 消息内容识别 vs 配置映射？
-3. 存储选型：SQLite（单机 MVP）→ PostgreSQL / Redis（规模化）？
-4. 向量库：Chroma（内嵌 MVP）→ LanceDB / Milvus？
-5. 轻量分类模型是否一期就做（Phase 3）？还是先固定模型直连？
-6. 流式响应是否一期支持（opencode 依赖流式，**建议一期必做**）？
-7. 审计保留策略？
+1. 命中率如何量化展示：上报 DeepSeek 的 `prompt_cache_hit_tokens` vs 网关自算公共前缀长度？— ✅ 已采用网关自算公共前缀（`stats.record_prefix`），上游 `prompt_cache_hit_tokens` 解析保留在响应缓存层
+2. 会话/项目 ID 从哪来：请求头注入 vs opencode 消息内容识别 vs 配置映射？— ✅ 已采用请求头 `x-project-id` / `x-session-id` / `x-user-id`（缺省 default）
+3. 存储选型：SQLite（单机 MVP）→ PostgreSQL / Redis（规模化）？— ⏳ MVP 用内存 + JSON 文件，规模化时再迁
+4. 向量库：Chroma（内嵌 MVP）→ LanceDB / Milvus？— ⏳ 当前用内置轻量向量近似（SemanticRouter），规模化时再迁
+5. 轻量分类模型是否一期就做（Phase 3）？还是先固定模型直连？— ✅ Phase 3 已做：多分类器并发 + 加权投票交叉验证；默认接入 opencode Zen 免费模型（免 key）
+6. 流式响应是否一期支持（opencode 依赖流式，**建议一期必做**）？— ✅ 已支持（`/v1/chat/completions` SSE 流式）
+7. 审计保留策略？— ✅ 已实现 `audit.keep_days` 滚动清理（默认 30 天）
+8. **Tier1/Tier2 命中时 Tier3 会话摘要被丢弃**— ✅ 已解决：`resolve` 改为 Tier1/2 命中后**合并追加** Tier3 摘要（`_merge_session`，见 app/layers/cache.py），多轮会话上下文延续
+9. 多领域长文本是否支持 top-k 多标签路由（当前单一标签取最高分）？— ⏳ 未做，单一标签

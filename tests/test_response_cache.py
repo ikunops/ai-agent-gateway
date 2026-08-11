@@ -65,6 +65,15 @@ def test_session_summary():
     assert "k8s" in s and "3 个节点" in s
 
 
+def test_session_summary_skips_greeting_line():
+    msgs = [
+        {"role": "user", "content": "你好\n谢谢\n帮我看看 MySQL 主从延迟"},
+    ]
+    s = make_session_summary(msgs, "已定位 binlog 堆积")
+    assert "MySQL 主从延迟" in s
+    assert "你好" not in s.split("\n")[0]
+
+
 def test_stats_snapshot_has_fields(tmp_path):
     snap = stats_snapshot()
     assert "hit_rate" in snap and "usd_saved" in snap and "uptime_s" in snap

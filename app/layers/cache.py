@@ -48,6 +48,8 @@ class CacheEngine:
     def __init__(self, project_root: Optional[Path] = None, max_sessions: int = 200):
         self.project_root = project_root
         self.sessions = SessionCache(max_sessions=max_sessions)
+        self._clarified: set = set()
+        self._clarified_lock = threading.Lock()
         self.registry = None
         self.route_profiles: Dict[str, str] = {}
 
@@ -85,13 +87,15 @@ class CacheEngine:
     def resolve(
         self, project_id: str, session_id: str, route_name: str
     ) -> Tuple[int, str]:
+        """四层降级：Tier1/2 命中时合并追加 Tier3 会话摘要（而非丢弃），
+        保证多轮会话中"用户已回答澄清问题"的上下文能延续到下一轮。"""
         tier1 = self._tier1(route_name)
         if tier1.strip():
-            return 1, tier1
+            return self._merge_session(1, tier1, project_id, session_id)
 
         tier2 = self._tier2(project_id)
         if tier2.strip():
-            return 2, tier2
+            return self._merge_session(2, tier2, project_id, session_id)
 
         tier3 = self.sessions.get(self._session_key(project_id, session_id))
         if tier3:
@@ -99,9 +103,26 @@ class CacheEngine:
 
         return 4, ""
 
+    def _merge_session(
+        self, tier: int, content: str, project_id: str, session_id: str
+    ) -> Tuple[int, str]:
+        summary = self.sessions.get(self._session_key(project_id, session_id))
+        if not summary:
+            return tier, content
+        return tier, f"{content}\n\n[会话历史摘要]\n{summary}"
+
     @staticmethod
     def _session_key(project_id: str, session_id: str) -> str:
         return f"{project_id}::{session_id}"
 
     def remember(self, project_id: str, session_id: str, summary: str) -> None:
         self.sessions.set(self._session_key(project_id, session_id), summary)
+
+    def mark_clarified(self, project_id: str, session_id: str) -> None:
+        """需求澄清模式每会话最多触发一轮，标记后不再触发。"""
+        with self._clarified_lock:
+            self._clarified.add(self._session_key(project_id, session_id))
+
+    def already_clarified(self, project_id: str, session_id: str) -> bool:
+        with self._clarified_lock:
+            return self._session_key(project_id, session_id) in self._clarified

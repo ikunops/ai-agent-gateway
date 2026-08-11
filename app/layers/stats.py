@@ -75,6 +75,10 @@ class Stats:
         self.counter.inc("routes", tier=tier if tier else 0, requests=1)
         self.counter.inc(f"tier{tier}", requests=1)
 
+    def record_clarify(self) -> None:
+        """需求澄清模式触发计数（评估拦截了多少模糊需求）。"""
+        self.counter.inc("clarify", requests=1)
+
     def record_saved(self, saved_chars: int = 0, saved_tokens: int = 0) -> None:
         self.counter.inc("savings", saved_tokens=saved_tokens, requests=1)
         if saved_chars:

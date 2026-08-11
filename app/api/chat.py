@@ -8,8 +8,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import Config, upstream_api_key
 from app.layers.cache import CacheEngine
+from app.layers.pipeline import process_request
 from app.layers.preprocess import auth_ok, clean_messages, parse_session
-from app.layers.system_builder import is_theoretical_query, reorganize_messages
 from app.layers.response_cache import (
     ResponseCache,
     build_sse_chunks,
@@ -20,7 +20,6 @@ from app.layers.response_cache import (
     stats_snapshot,
 )
 from app.layers.stats import Stats
-from app.layers.system_builder import is_theoretical_query, reorganize_messages
 from app.upstream.llm import UpstreamClient
 
 router = APIRouter()
@@ -68,6 +67,13 @@ async def chat_completions(
 ):
     config, stats, cache, resp_cache, router, llm_router = _services(request)
 
+    if not config.upstream.base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="网关为纯整形模式（未配置 upstream.base_url）：请使用 POST /v1/refine "
+                   "获取增强后的请求，由 Agent 侧转发给用户当前选择的模型",
+        )
+
     key = x_api_key
     if not key and authorization and authorization.lower().startswith("bearer "):
         key = authorization[len("bearer ") :]
@@ -84,9 +90,6 @@ async def chat_completions(
 
     session = parse_session(dict(request.headers), messages)
     cleaned = clean_messages(messages)
-
-    theoretical = is_theoretical_query(cleaned)
-
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     upstream = UpstreamClient(config.upstream.base_url, upstream_api_key(config) or "sk-none")
 
@@ -106,33 +109,38 @@ async def chat_completions(
 
     stats_miss()
 
-    all_text = " ".join(
-        m.get("content", "") for m in cleaned if isinstance(m.get("content"), str)
+    result = await process_request(
+        cleaned=cleaned,
+        session=session,
+        model=model,
+        config=config,
+        cache=cache,
+        router=router,
+        llm_router=llm_router,
+        stats=stats,
+        routing_ledger=request.app.state.routing_ledger,
+        request_id=request_id,
     )
-    context_text = "\n".join(
-        f"{m.get('role')}: {str(m.get('content', ''))[:300]}"
-        for m in cleaned[-6:-1]
-        if isinstance(m.get("content"), str)
+    final_messages = result["messages"]
+    clarify_mode = result["clarify"]
+    route_name, route_score, route_source = (
+        result["route_name"], result["route_score"], result["route_source"]
     )
-    route_name, route_score, route_source = await router.route(
-        all_text, llm_judge=llm_router.judge, context=context_text
-    )
-    tier, tier_content = cache.resolve(session.project_id, session.session_id, route_name)
-    routing_note = ""
-    if tier_content:
-        routing_note = f"已匹配项目上下文（Tier{tier}）。" if tier > 1 else f"领域路由[{route_name}]（{route_source}，得分{route_score:.2f}）。"
+    route_meta = result["route_meta"]
+    tier = result["tier"]
+    overlap = result["overlap"]
+    permission = result["permission"]
 
-    final_messages = reorganize_messages(
-        cleaned,
-        anchor_prompt=config.anchor_prompt,
-        project_context=tier_content,
-        session_context="",
-        routing_note=routing_note,
-        skip_anchor=theoretical,
-    )
-    system_text = final_messages[0].get("content", "") if final_messages else ""
-    prefix_key = f"{session.project_id}::{session.session_id}::{model}"
-    overlap = stats.record_prefix(prefix_key, system_text)
+    if permission["action"] == "block":
+        hint = ("[权限拦截] 用户请求含高危指令（"
+                + "、".join(m["label"] for m in permission["matched"])
+                + "），当前权限等级 " + permission["level"]
+                + " 不允许执行。请解释风险并引导用户升级权限或改用低危方案，不要执行。")
+        final_messages = [{"role": "system", "content": hint}] + final_messages
+    perm_header = {
+        "X-Gateway-Permission": permission["action"],
+        "X-Gateway-Permission-Level": permission["level"],
+    }
 
     payload_out = {
         "model": model,
@@ -159,11 +167,13 @@ async def chat_completions(
                 )
                 stats.audit.log(_audit_record(
                     request_id, session, tier, overlap,
-                    {"cache": "miss", "route": {"name": route_name, "source": route_source, "score": route_score}},
+                    {"cache": "miss", "clarify": clarify_mode,
+                     "route": {"name": route_name, "source": route_source, "score": route_score}},
                 ))
                 return JSONResponse(
                     content=data,
-                    headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id},
+                    headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id,
+                             **perm_header},
                 )
 
         return await _non_stream()
@@ -210,13 +220,15 @@ async def chat_completions(
             )
         stats.audit.log(_audit_record(
             request_id, session, tier, overlap,
-            {"cache": "miss-stream", "route": {"name": route_name, "source": route_source, "score": route_score}},
+            {"cache": "miss-stream", "clarify": clarify_mode,
+             "route": {"name": route_name, "source": route_source, "score": route_score}},
         ))
 
     return StreamingResponse(
         _stream(),
         media_type="text/event-stream",
-        headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id},
+        headers={"X-Gateway-Cache": "MISS", "X-Gateway-Project-Id": session.project_id,
+                 **perm_header},
     )
 
 

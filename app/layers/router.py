@@ -6,9 +6,18 @@ import time
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
+from app.layers.text_analysis import (
+    build_routing_digest,
+    build_routing_digest_detailed,
+    extract_tech_terms,
+    route_name_from_terms,
+    split_segments,
+)
+
 _CACHE_DEFAULT_TTL = 3600
 _CACHE_MAX = 1024
 _SIM_THRESHOLD = 0.7
+_MAX_SEGMENTS = 8
 
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+")
 
@@ -123,10 +132,12 @@ class SemanticRouter:
         profiles: Dict[str, str],
         threshold: float = _SIM_THRESHOLD,
         cache_ttl: int = _CACHE_DEFAULT_TTL,
+        picker=None,
     ):
         self.profiles = {name: RouteProfile(name, desc) for name, desc in profiles.items()}
         self.threshold = threshold
         self.ttl = cache_ttl
+        self.picker = picker
         self._cache: "OrderedDict[str, Tuple[str, float, str, float]]" = OrderedDict()
         self._lock = threading.Lock()
         self._tfidf = TfidfEmbedder()
@@ -140,29 +151,41 @@ class SemanticRouter:
         self._tfidf.fit(descs)
         self._profile_vecs = [(n, self._tfidf.embed(d)) for n, d in zip(names, descs)]
 
-    def _vector_match(self, text: str) -> Optional[Tuple[str, float]]:
+    def _vector_match(
+        self, text: str
+    ) -> Tuple[Optional[str], float, str, Dict[str, float]]:
+        """返回 (最佳画像名(可 None), 最佳得分, 最佳段, {画像: 最高分段得分})。
+        阈值判断交给调用方，最佳段与得分表始终返回（供摘要与观测）。"""
+        segs = split_segments(text)
+        if len(segs) > _MAX_SEGMENTS:
+            segs = segs[:_MAX_SEGMENTS // 2] + segs[-(_MAX_SEGMENTS // 2):]
+        scores: Dict[str, float] = {}
+        best_name: Optional[str] = None
+        best_score, best_seg = -1.0, ""
         if self._fast.available:
             try:
-                q = self._fast.embed([text])[0]
+                qs = self._fast.embed(segs)
                 pd = self._fast.embed([p.description for p in self.profiles.values()])
-                best_name, best_score = None, -1.0
-                for name, pv in zip(self.profiles.keys(), pd):
-                    score = _cosine(q, pv)
-                    if score > best_score:
-                        best_name, best_score = name, score
-                if best_name and best_score >= self.threshold:
-                    return best_name, best_score
+                names = list(self.profiles.keys())
+                for q, seg in zip(qs, segs):
+                    for name, pv in zip(names, pd):
+                        score = _cosine(q, pv)
+                        if score > scores.get(name, -1.0):
+                            scores[name] = score
+                        if score > best_score:
+                            best_name, best_score, best_seg = name, score, seg
+                return best_name, best_score, best_seg, scores
             except Exception:
                 pass
-        qv = self._tfidf.embed(text)
-        best_name, best_score = None, -1.0
-        for name, pv in self._profile_vecs:
-            score = self._tfidf.similarity(qv, pv)
-            if score > best_score:
-                best_name, best_score = name, score
-        if best_name and best_score >= self.threshold:
-            return best_name, best_score
-        return None
+        for seg in segs:
+            qv = self._tfidf.embed(seg)
+            for name, pv in self._profile_vecs:
+                score = self._tfidf.similarity(qv, pv)
+                if score > scores.get(name, -1.0):
+                    scores[name] = score
+                if score > best_score:
+                    best_name, best_score, best_seg = name, score, seg
+        return best_name, best_score, best_seg, scores
 
     def _cache_get(self, key: str) -> Optional[Tuple[str, float, str, float]]:
         with self._lock:
@@ -188,29 +211,96 @@ class SemanticRouter:
         llm_judge=None,
         context: str = "",
     ) -> Tuple[str, float, str]:
-        """返回 (route_name, score, source)。source: cache/vector/llm/fallback"""
+        """返回 (route_name, score, source)。source: cache/term/vector/llm/fallback"""
+        name, score, source, _meta = await self.route_detailed(
+            text, llm_judge=llm_judge, context=context
+        )
+        return name, score, source
+
+    async def route_detailed(
+        self,
+        text: str,
+        llm_judge=None,
+        context: str = "",
+    ) -> Tuple[str, float, str, Dict]:
+        """同 route()，额外返回决策明细 meta（供路由观测记录）：
+        terms / segments / vector_scores / best_segment / digest_len /
+        fidelity_forced / vector_latency_ms / judge_latency_ms"""
         key_src = text
         if context.strip():
             key_src = f"{text}\n<ctx>{context[-800:]}</ctx>"
         key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()
 
+        terms = extract_tech_terms(text)
+        meta: Dict = {"terms": terms, "segments": len(split_segments(text))}
+
         hit = self._cache_get(key)
         if hit:
-            return hit[0], hit[1], "cache"
+            meta.update({"source": "cache"})
+            return hit[0], hit[1], "cache", meta
 
-        m = self._vector_match(text)
-        if m:
-            name, score = m
-            self._cache_set(key, name, score, "vector")
-            return name, score, "vector"
+        term_name = route_name_from_terms(text, self.profiles)
+        if term_name:
+            self._cache_set(key, term_name, 0.95, "term")
+            meta.update({"source": "term"})
+            return term_name, 0.95, "term", meta
+
+        t0 = time.time()
+        best_name, best_score, best_seg, scores = self._vector_match(text)
+        vec_ms = int((time.time() - t0) * 1000)
+        meta.update({
+            "vector_latency_ms": vec_ms,
+            "vector_scores": _top_scores(scores),
+            "best_segment": best_seg[:100],
+        })
+        if best_name and best_score >= self.threshold:
+            self._cache_set(key, best_name, best_score, "vector")
+            meta.update({"source": "vector"})
+            return best_name, best_score, "vector", meta
 
         if llm_judge is not None:
-            name = await llm_judge(text, list(self.profiles.keys()), context=context)
+            t1 = time.time()
+            digest, forced = build_routing_digest_detailed(text, best_segment=best_seg)
+            judge_fn = getattr(llm_judge, "judge_detailed", None) or llm_judge
+            result = await judge_fn(digest, list(self.profiles.keys()), context=context)
+            judge_ms = int((time.time() - t1) * 1000)
+            if isinstance(result, tuple):
+                name, vote_meta = result
+            else:
+                name, vote_meta = result, {}
+            meta.update({
+                "judge_latency_ms": judge_ms,
+                "digest_len": len(digest),
+                "fidelity_forced": forced,
+            })
+            if vote_meta:
+                meta["vote"] = vote_meta
             if name and name in self.profiles:
                 self._cache_set(key, name, 1.0, "llm")
-                return name, 1.0, "llm"
+                meta.update({"source": "llm"})
+                score = vote_meta.get("agreement", 1.0) if vote_meta else 1.0
+                return name, score, "llm", meta
 
-        return "", 0.0, "fallback"
+        meta.update({"source": "fallback"})
+        return "", 0.0, "fallback", meta
+
+    async def _digest_for_judge(self, text: str) -> str:
+        """本地抽取模型选段 → 保真闸门 → 幻觉校验；失败回退确定性摘要。"""
+        if self.picker is not None and len(text) > 500:
+            try:
+                picked = await self.picker.pick(text)
+            except Exception:
+                picked = None
+            if picked:
+                digest = build_routing_digest(text, picked_segments=picked)
+                if digest != text:
+                    return digest
+        return build_routing_digest(text)
+
+
+def _top_scores(scores: Dict[str, float], k: int = 3) -> Dict[str, float]:
+    top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return {name: round(score, 3) for name, score in top}
 
 
 def _cosine(a: List[float], b: List[float]) -> float:

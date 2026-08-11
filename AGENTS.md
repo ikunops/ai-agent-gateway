@@ -22,10 +22,15 @@
 ## 项目信息
 
 - **定位**：AI Gateway = Agent 与 LLM 之间的路由导航层（独立项目），只做中间的路由导航指引，不思考、不存长期记忆、不拥有知识库、不执行操作
+- **主形态 = 纯整形**：网关不持有任何模型 key、不选模型、不替模型回复。POST /v1/refine 返回"增强后的请求（refined.messages）+ 路由元信息（meta）"，由 Agent 侧（opencodego）转发给用户当前选择的模型（用户切模型只影响 Agent 侧，网关无感知）。转发模式（/v1/chat/completions）仅在有 upstream.base_url 配置时可用（config.yaml 默认配了 DeepSeek，是转发模式）
+- **分类器由用户自定**：gateway.classifiers（任意 OpenAI 兼容端点，本地 Ollama 免密钥 / DeepSeek / 中转站）→ 并发调用 + 加权投票交叉验证，agreement 作为路由得分；未配 classifiers 时回退 upstream.default 单分类器；都没有则纯本地规则路由。分类器实现见 app/upstream/classifier.py（ClassifierClient / ClassifierEnsemble）
 - **技术栈**：Python 3.11 + FastAPI
 - **架构文档**：`docs/architecture.md`（评审通过前不写业务代码）
-- **两端可插拔**：Agent 侧（opencode 或其他 Agent）与 LLM 侧（DeepSeek 或其他模型）均以 OpenAI 兼容接口接入，互不绑定；首期接入 opencode + DeepSeek
-- **核心职责**：请求清洗、System 前缀稳定化（提升模型侧缓存命中率）、四层缓存降级（Tier1-4）、三路路由仲裁（向量+知识库+LLM）、状态优先行动协议注入、统计审计
+- **核心职责**：请求清洗、System 前缀稳定化（提升模型侧缓存命中率）、四层缓存降级（Tier1-4）、三路路由仲裁（技术词快路径+向量+LLM）、状态优先行动协议注入、统计审计
+- **渐进式约束（先理解、后约束）**：理论问题跳过锚点；模糊开发需求（开发动词+无技术词+短文本）进入"需求澄清模式"——跳过路由、强制 Tier4、注入澄清问题到 User 尾部（不污染 System 前缀）、每会话最多一轮（CacheEngine.mark_clarified）
+- **摘要保真契约**：路由摘要只影响选路、永远不替代转发原文；抽取式（模型只选原文段编号，禁止改写）；保真闸门（否定词/连接词/关键符号段强制保留）；幻觉校验（非原文段整体弃用回退）；本地模型可插拔（digest.local_picker，默认关闭）
+- **长文本**：墙式文本（无换行≥300字符）按句子二次切分；向量最佳段并入摘要；技术词快路径永远扫全量原文
+- **路由观测**：每次路由决策写 Routing Ledger（logs/routing/ 每日 JSONL），GET /v1/stats/routing 看来源分布/高频词/延迟，据此调阈值、TECH_TERMS 词表与 route profiles
 - **关键设计**：
   - System 只放稳定内容，动态杂质（时间戳/随机数）下沉到 User 尾部 → 前缀不变 → 命中率高
   - 项目 ID 与 会话 ID 都是缓存 Key；Tier3 会话命中优先于 Tier4 兜底

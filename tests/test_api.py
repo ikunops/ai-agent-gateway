@@ -15,12 +15,14 @@ from app.main import create_app
 
 class MockUpstream(BaseHTTPRequestHandler):
     calls = 0
+    last_body = {}
 
     def do_POST(self):
         type(self).calls += 1
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) or b"{}"
         body = json.loads(raw)
+        type(self).last_body = body
         stream = bool(body.get("stream", False))
         model = body.get("model", "unknown")
         if stream:
@@ -132,6 +134,20 @@ def test_stats_recorded(client):
     assert "exact_cache" in snap
 
 
+def test_routing_stats_endpoint(client):
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-API-Key": "test-key"},
+        json={"messages": [{"role": "user", "content": "帮我查 k8s 日志"}], "stream": False},
+    )
+    r = client.get("/v1/stats/routing")
+    assert r.status_code == 200
+    s = r.json()
+    assert s["records"] >= 1
+    assert s["by_source"]
+    assert "by_tier" in s and "top_terms" in s
+
+
 def test_exact_cache_hit_skips_upstream(client):
     body = {"messages": [{"role": "user", "content": "完全相同的请求"}], "stream": False}
     r1 = client.post(
@@ -160,6 +176,47 @@ def test_stream_fills_cache_then_nonstream_hits(client):
     assert r2.status_code == 200
     assert r2.headers.get("X-Gateway-Cache") == "HIT"
     assert MockUpstream.calls == calls_after
+
+
+def test_vague_request_injects_clarify_and_skips_anchor(client):
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-API-Key": "test-key", "X-Session-Id": "cls1"},
+        json={"messages": [{"role": "user", "content": "开发一个手机清理工具"}], "stream": False},
+    )
+    body = MockUpstream.last_body
+    system = body["messages"][0]["content"]
+    assert "ANCHOR PROTOCOL" not in system
+    last = body["messages"][-1]["content"]
+    assert "开发一个手机清理工具" in last
+    assert "[需求澄清模式]" in last
+
+
+def test_vague_one_shot_per_session(client):
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-API-Key": "test-key", "X-Session-Id": "cls2"},
+        json={"messages": [{"role": "user", "content": "开发一个手机清理工具"}], "stream": False},
+    )
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-API-Key": "test-key", "X-Session-Id": "cls2"},
+        json={"messages": [{"role": "user", "content": "帮我写一个天气应用"}], "stream": False},
+    )
+    body = MockUpstream.last_body
+    assert "ANCHOR PROTOCOL" in body["messages"][0]["content"]
+    assert "[需求澄清模式]" not in body["messages"][-1]["content"]
+
+
+def test_vague_with_tech_word_routes_normally(client):
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-API-Key": "test-key"},
+        json={"messages": [{"role": "user", "content": "用python写一个清理工具"}], "stream": False},
+    )
+    body = MockUpstream.last_body
+    assert "ANCHOR PROTOCOL" in body["messages"][0]["content"]
+    assert "[需求澄清模式]" not in body["messages"][-1]["content"]
 
 
 def test_project_registry(client, tmp_path):

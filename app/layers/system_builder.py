@@ -1,6 +1,8 @@
 import re
 from typing import Dict, List
 
+from app.layers.text_analysis import DEV_VERBS, NEGATION_WORDS, TECH_TERMS, VAGUE_MAX_CHARS
+
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
@@ -12,6 +14,9 @@ _UUID_RE = re.compile(
     r"(?i)\b[0-9a-f]{32}\b|\b[0-9a-f]{16}\b"
 )
 _NUMBER_RE = re.compile(r"\b\d{6,}\b")
+
+# 动态杂质下沉到 User 尾部时最多保留的条目数（防止长日志粘贴导致尾部膨胀）
+_MAX_IMPURITIES = 20
 
 
 def extract_dynamic_impurities(text: str) -> tuple[str, List[str]]:
@@ -26,7 +31,10 @@ def extract_dynamic_impurities(text: str) -> tuple[str, List[str]]:
     _grab(_DATE_RE)
     _grab(_RANDOM_RE)
     _grab(_NUMBER_RE)
-    return text, found
+    unique = list(dict.fromkeys(found))
+    # 剔除被更长条目包含的子串（如完整时间戳内嵌的日期）
+    unique = [x for x in unique if not any(x != y and x in y for y in unique)]
+    return text, unique[:_MAX_IMPURITIES]
 
 
 def build_system(
@@ -79,6 +87,45 @@ def is_theoretical_query(messages: List[Dict]) -> bool:
     return False
 
 
+def _last_user_text(messages: List[Dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = [p.get("text", "") for p in content if isinstance(p, dict)]
+            content = " ".join(parts)
+        return str(content)
+    return ""
+
+
+def is_vague_development_request(messages: List[Dict]) -> bool:
+    """模糊开发需求检测：含开发动词、无技术栈词、且未否定。
+
+    守卫（全部满足才返回 True）：
+    1. 理论问题不触发（"什么是手机清理工具"是提问不是开发）
+    2. 否定词在动词前 4 字符内 → 不触发（"不需要开发"）
+    3. 短文本限制（<=60 字符，长文本自带规格）
+    4. 仅看最后一条 user 消息（多轮只对最新诉求判定）
+    """
+    text = _last_user_text(messages)
+    if not text or len(text) > VAGUE_MAX_CHARS:
+        return False
+    if is_theoretical_query(messages):
+        return False
+    lower = text.lower()
+    if any(t in lower for t in TECH_TERMS):
+        return False
+    for verb in DEV_VERBS:
+        idx = lower.find(verb)
+        while idx != -1:
+            ctx = lower[max(0, idx - 4) : idx]
+            if not any(neg in ctx for neg in NEGATION_WORDS):
+                return True
+            idx = lower.find(verb, idx + 1)
+    return False
+
+
 def reorganize_messages(
     messages: List[Dict],
     anchor_prompt: str,
@@ -86,6 +133,7 @@ def reorganize_messages(
     session_context: str = "",
     routing_note: str = "",
     skip_anchor: bool = False,
+    clarification_hint: str = "",
 ) -> List[Dict]:
     if not messages:
         return []
@@ -128,6 +176,15 @@ def reorganize_messages(
 
     result: List[Dict] = [{"role": "system", "content": full_system}]
     result.extend(rest)
+
+    if clarification_hint:
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user" and isinstance(result[i].get("content"), str):
+                result[i] = {
+                    **result[i],
+                    "content": result[i]["content"] + "\n\n" + clarification_hint,
+                }
+                break
     return result
 
 
