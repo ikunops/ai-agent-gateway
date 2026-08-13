@@ -453,7 +453,7 @@ ai-gateway/
 2. 会话/项目 ID 从哪来：请求头注入 vs opencode 消息内容识别 vs 配置映射？— ✅ 已采用请求头 `x-project-id` / `x-session-id` / `x-user-id`（缺省 default）
 3. 存储选型：SQLite（单机 MVP）→ PostgreSQL / Redis（规模化）？— ⏳ MVP 用内存 + JSON 文件，规模化时再迁
 4. 向量库：Chroma（内嵌 MVP）→ LanceDB / Milvus？— ⏳ 当前用内置轻量向量近似（SemanticRouter），规模化时再迁
-5. 轻量分类模型是否一期就做（Phase 3）？还是先固定模型直连？— ✅ Phase 3 已做：多分类器并发 + 加权投票交叉验证；默认接入 opencode Zen 免费模型（免 key）
+5. 轻量分类模型是否一期就做（Phase 3）？还是先固定模型直连？— ✅ Phase 3 已做：多分类器本地池轮询单分类器 + 第一个成功者出票（注意：非并发加权投票，实现见 app/upstream/classifier.py ClassifierEnsemble）；默认接入 opencode Zen 免费模型（免 key）
 6. 流式响应是否一期支持（opencode 依赖流式，**建议一期必做**）？— ✅ 已支持（`/v1/chat/completions` SSE 流式）
 7. 审计保留策略？— ✅ 已实现 `audit.keep_days` 滚动清理（默认 30 天）
 8. **Tier1/Tier2 命中时 Tier3 会话摘要被丢弃**— ✅ 已解决：`resolve` 改为 Tier1/2 命中后**合并追加** Tier3 摘要（`_merge_session`，见 app/layers/cache.py），多轮会话上下文延续

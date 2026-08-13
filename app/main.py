@@ -37,6 +37,8 @@ def _build_classifier(config: Config):
             api_key=os.environ.get(str(c.get("api_key_env", "")), ""),
             model=str(c.get("model", "qwen2.5:7b")),
             weight=float(c.get("weight", 1.0)),
+            local=bool(c.get("local", True)),
+            timeout=float(c.get("timeout", 90.0)),
         ))
     if clients:
         return ClassifierEnsemble(clients) if len(clients) > 1 else clients[0]
@@ -44,6 +46,7 @@ def _build_classifier(config: Config):
         return ClassifierClient(
             "default", config.upstream.base_url,
             upstream_api_key(config) or "", config.upstream.default_model,
+            timeout=90.0,
         )
     return None
 

@@ -27,11 +27,24 @@ class UpstreamConfig(BaseModel):
     default_model: str = "deepseek-chat"
 
 
+class UpstreamRoute(BaseModel):
+    """按模型名匹配的上游路由。用于透明代理多来源模型：
+    请求带哪个 model，就转发到对应 base_url，用对应 api key。"""
+
+    name: str
+    base_url: str = ""
+    api_key_env: str = ""
+    default_model: str = ""
+    match_models: List[str] = []
+    match_suffix: str = ""
+
+
 class Config(BaseModel):
     server_host: str = "127.0.0.1"
-    server_port: int = 8080
+    server_port: int = 8901
     api_keys: Dict[str, str] = {"default": "gateway-dev-key"}
     upstream: UpstreamConfig
+    upstream_routes: List[UpstreamRoute] = []
     anchor_prompt: str = ""
     clarify_prompt: str = DEFAULT_CLARIFY_PROMPT
     project_agents: Dict[str, str] = {}
@@ -48,6 +61,23 @@ class Config(BaseModel):
     audit_keep_days: int = 30
     data_dir: str = "data"
     permission_level: str = "L1"
+
+    def resolve_upstream(self, model: str) -> UpstreamRoute:
+        """按 model 名解析上游路由。兼容 opencode 的 `provider/model` 前缀格式。
+        规则：先精确匹配 match_models，再匹配 match_suffix 后缀；都不中则返回默认上游（name=""）。"""
+        normalized = model.split("/")[-1] if "/" in model else model
+        for route in self.upstream_routes:
+            if normalized in route.match_models:
+                return route
+        for route in self.upstream_routes:
+            if route.match_suffix and normalized.endswith(route.match_suffix):
+                return route
+        return UpstreamRoute(
+            name="default",
+            base_url=self.upstream.base_url,
+            api_key_env=self.upstream.api_key_env,
+            default_model=self.upstream.default_model,
+        )
 
 
 def _deep_get(data: Dict[str, Any], path: str, default: Any = None) -> Any:
@@ -82,15 +112,31 @@ def load_config(path: Path = ROOT / "config.yaml") -> Config:
     upstream_raw = _deep_get(raw, "upstream.default", {}) or {}
     api_key_env = upstream_raw.get("api_key_env", "DEEPSEEK_API_KEY")
 
+    upstream_routes: List[UpstreamRoute] = []
+    for r in _deep_get(raw, "upstream.routes", []) or []:
+        if not isinstance(r, dict):
+            continue
+        upstream_routes.append(
+            UpstreamRoute(
+                name=str(r.get("name", "")),
+                base_url=str(r.get("base_url", "")),
+                api_key_env=str(r.get("api_key_env", "")),
+                default_model=str(r.get("default_model", "")),
+                match_models=[str(m) for m in (r.get("match_models") or [])],
+                match_suffix=str(r.get("match_suffix", "")),
+            )
+        )
+
     return Config(
         server_host=_deep_get(raw, "server.host", "127.0.0.1"),
-        server_port=int(_deep_get(raw, "server.port", 8080)),
+        server_port=int(_deep_get(raw, "server.port", 8901)),
         api_keys=_deep_get(raw, "auth.api_keys", {}),
         upstream=UpstreamConfig(
             base_url=upstream_raw.get("base_url", ""),
             api_key_env=api_key_env,
             default_model=upstream_raw.get("default_model", "deepseek-chat"),
         ),
+        upstream_routes=upstream_routes,
         anchor_prompt=_deep_get(raw, "gateway.anchor_prompt", ""),
         clarify_prompt=_deep_get(raw, "gateway.clarify_prompt", DEFAULT_CLARIFY_PROMPT),
         project_agents=_deep_get(raw, "gateway.project_agents", {}),

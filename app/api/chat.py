@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import uuid
 from typing import Dict, Optional
@@ -6,8 +7,9 @@ from typing import Dict, Optional
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.core.config import Config, upstream_api_key
+from app.core.config import Config
 from app.layers.cache import CacheEngine
+from app.layers.permissions import check_permission
 from app.layers.pipeline import process_request
 from app.layers.preprocess import auth_ok, clean_messages, parse_session
 from app.layers.response_cache import (
@@ -67,10 +69,13 @@ async def chat_completions(
 ):
     config, stats, cache, resp_cache, router, llm_router = _services(request)
 
-    if not config.upstream.base_url:
+    has_upstream = bool(config.upstream.base_url) or any(
+        r.base_url for r in config.upstream_routes
+    )
+    if not has_upstream:
         raise HTTPException(
             status_code=400,
-            detail="网关为纯整形模式（未配置 upstream.base_url）：请使用 POST /v1/refine "
+            detail="网关为纯整形模式（未配置 upstream.base_url / upstream.routes）：请使用 POST /v1/refine "
                    "获取增强后的请求，由 Agent 侧转发给用户当前选择的模型",
         )
 
@@ -86,26 +91,48 @@ async def chat_completions(
     payload_in = json.loads(body)
     messages: list = payload_in.get("messages", [])
     stream: bool = bool(payload_in.get("stream", False))
-    model: str = payload_in.get("model", config.upstream.default_model)
+    model: str = payload_in.get("model", "")
+    normalized = model.split("/")[-1] if "/" in model else model
+
+    route = config.resolve_upstream(normalized)
+    if not route.base_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型 {model!r} 未匹配任何上游路由，且未配置默认 upstream",
+        )
+    model = normalized or route.default_model
 
     session = parse_session(dict(request.headers), messages)
     cleaned = clean_messages(messages)
     request_id = f"req_{uuid.uuid4().hex[:12]}"
-    upstream = UpstreamClient(config.upstream.base_url, upstream_api_key(config) or "sk-none")
+    upstream = UpstreamClient(route.base_url, os.environ.get(route.api_key_env, "") or "sk-none")
 
     exact_key = request_cache_key(body)
     cached = resp_cache.get(exact_key)
     if cached:
-        stats_hit(cached)
-        stats.audit.log(_audit_record(request_id, session, None, 0, {"cache": "exact-hit"}))
-        resp_headers = {"X-Gateway-Cache": "HIT", "X-Gateway-Project-Id": session.project_id}
-        if stream:
-            return StreamingResponse(
-                (_sse_packet(c) for c in build_sse_chunks(cached) + [{"done": True}]),
-                media_type="text/event-stream",
-                headers=resp_headers,
-            )
-        return JSONResponse(content=cached, headers=resp_headers)
+        cached_perm = check_permission(
+            " ".join(
+                m.get("content", "")
+                for m in messages
+                if m.get("role") == "user" and isinstance(m.get("content"), str)
+            ),
+            request.headers.get("x-permission-level", "").strip().upper() or config.permission_level,
+        )
+        if cached_perm["action"] != "block":
+            stats_hit(cached)
+            stats.audit.log(_audit_record(request_id, session, None, 0, {"cache": "exact-hit"}))
+            resp_headers = {"X-Gateway-Cache": "HIT", "X-Gateway-Project-Id": session.project_id}
+            if stream:
+                async def _cached_stream():
+                    for c in build_sse_chunks(cached):
+                        yield _sse_packet(c)
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(
+                    _cached_stream(),
+                    media_type="text/event-stream",
+                    headers=resp_headers,
+                )
+            return JSONResponse(content=cached, headers=resp_headers)
 
     stats_miss()
 
@@ -130,6 +157,8 @@ async def chat_completions(
     tier = result["tier"]
     overlap = result["overlap"]
     permission = result["permission"]
+    if x_perm := request.headers.get("x-permission-level", "").strip().upper():
+        permission = check_permission(result["user_text"], x_perm)
 
     if permission["action"] == "block":
         hint = ("[权限拦截] 用户请求含高危指令（"
@@ -143,11 +172,12 @@ async def chat_completions(
     }
 
     payload_out = {
-        "model": model,
-        "messages": final_messages,
-        "temperature": payload_in.get("temperature", 1.0),
-        "max_tokens": payload_in.get("max_tokens"),
+        k: v
+        for k, v in payload_in.items()
+        if k not in ("model", "messages", "stream")
     }
+    payload_out["model"] = model
+    payload_out["messages"] = final_messages
     if stream:
         payload_out["stream"] = True
 
@@ -159,12 +189,13 @@ async def chat_completions(
                 data = item["data"]
                 stats.record_completion(request_id, _usage_tokens(data), _now_ms())
                 stats.record_route(request_id, session.project_id, session.session_id, tier)
-                resp_cache.set(exact_key, data)
-                cache.remember(
-                    session.project_id,
-                    session.session_id,
-                    make_session_summary(cleaned, _reply_text(data)),
-                )
+                if permission["action"] != "block":
+                    resp_cache.set(exact_key, data)
+                    cache.remember(
+                        session.project_id,
+                        session.session_id,
+                        make_session_summary(cleaned, _reply_text(data)),
+                    )
                 stats.audit.log(_audit_record(
                     request_id, session, tier, overlap,
                     {"cache": "miss", "clarify": clarify_mode,
@@ -185,8 +216,12 @@ async def chat_completions(
                                         "finish_reason": None}]})
         content = ""
         usage = None
+        finish_reason = None
+        tool_calls: Dict[int, Dict] = {}
+        upstream_failed = False
         async for item in upstream.chat_completions(payload_out, stream=True):
             if item["type"] == "error":
+                upstream_failed = True
                 yield _sse_packet({"error": {"message": item["body"], "type": "upstream_error",
                                              "code": item["status"]}})
                 continue
@@ -197,19 +232,46 @@ async def chat_completions(
                 for ch in chunk.get("choices", []):
                     delta = ch.get("delta", {})
                     content += delta.get("content") or ""
-                    content += delta.get("reasoning_content") or ""
+                    if ch.get("finish_reason"):
+                        finish_reason = ch["finish_reason"]
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        acc = tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            acc["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        acc["name"] += fn.get("name") or ""
+                        acc["arguments"] += fn.get("arguments") or ""
                 yield _sse_packet(chunk)
             elif item["type"] == "done":
                 yield "data: [DONE]\n\n"
+        if upstream_failed:
+            yield "data: [DONE]\n\n"
+            stats.audit.log(_audit_record(
+                request_id, session, tier, overlap,
+                {"cache": "miss-stream-upstream-error", "clarify": clarify_mode,
+                 "route": {"name": route_name, "source": route_source, "score": route_score}},
+            ))
+            return
         stats.record_route(request_id, session.project_id, session.session_id, tier)
-        if content or usage:
+        if permission["action"] != "block" and (content or usage or tool_calls):
+            message: Dict = {"role": "assistant", "content": content}
+            if tool_calls:
+                message["tool_calls"] = [
+                    {
+                        "id": v["id"] or f"call_{i}",
+                        "type": "function",
+                        "function": {"name": v["name"], "arguments": v["arguments"]},
+                    }
+                    for i, v in sorted(tool_calls.items())
+                ]
             cached_resp = {
                 "id": request_id,
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                             "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": message,
+                             "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop")}],
                 "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
             resp_cache.set(exact_key, cached_resp)

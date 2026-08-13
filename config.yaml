@@ -1,6 +1,6 @@
 server:
   host: 127.0.0.1
-  port: 8080
+  port: 8901
 
 auth:
   api_keys:
@@ -14,51 +14,113 @@ upstream:
     base_url: "https://opencode.ai/zen/v1"
     api_key_env: ""
     default_model: "deepseek-v4-flash-free"
+  # 透明代理多上游：按 model 名把请求转发到对应端点（/v1/chat/completions 用）。
+  # resolve_upstream 规则：先精确匹配 match_models，再匹配 match_suffix，都不中回退 default。
+  routes:
+    # opencode Go 订阅（付费，13+ 模型）：https://opencode.ai/docs/go
+    # 需设置环境变量 OPENCODE_GO_API_KEY（登录 zen → 订阅 Go → 复制 API key）
+    - name: zen-go
+      base_url: "https://opencode.ai/zen/go/v1"
+      api_key_env: "OPENCODE_GO_API_KEY"
+      default_model: "deepseek-v4-flash"
+      match_models:
+        - deepseek-v4-flash
+        - deepseek-v4-pro
+        - glm-5
+        - glm-5.1
+        - glm-5.2
+        - gpt-5.6-luna
+        - grok-4.5
+        - hy3
+        - hy3-preview
+        - kimi-k2.5
+        - kimi-k2.6
+        - kimi-k2.7-code
+        - kimi-k3
+        - mimo-v2.5
+        - mimo-v2.5-pro
+        - mimo-v2-omni
+        - mimo-v2-pro
+        - minimax-m2.5
+        - minimax-m2.7
+        - minimax-m3
+        - qwen3.5-plus
+        - qwen3.6-plus
+        - qwen3.7-max
+        - qwen3.7-plus
+        - qwen3.8-max
+    # opencode Zen 免费模型池（-free 后缀）→ zen/v1，无需 key
+    - name: zen-free
+      base_url: "https://opencode.ai/zen/v1"
+      api_key_env: ""
+      default_model: "deepseek-v4-flash-free"
+      match_suffix: "-free"
 
 gateway:
-  # 多分类器交叉验证（推荐）：模型完全由你决定，任意 OpenAI 兼容端点，
-  # 本地免费（Ollama）/云端（DeepSeek、中转站、自建）混用，密钥可空。
-  # 网关并发调用全部分类器 → 加权投票 → 一致性(agreement)作为路由得分。
+  # 分类器仲裁：本地池按 round-robin 轮询挑选 1 个（单次仲裁延迟=单个模型），
+  # 失败自动回退到池内下一个；本地池全部失败才降级 remote。模型完全由你决定，
+  # 任意 OpenAI 兼容端点，本地免费（Ollama）/云端（DeepSeek、中转站、自建）混用。
   classifiers:
-    # opencode Zen free 模型交叉验证：全部免 API key，OpenAI 兼容端点
-    # https://opencode.ai/zen/v1
-    # 实测仅以下 3 个能遵守"只输出路线名"指令（2026-08-12 验证）：
-    # deepseek / longcat / laguna 对 oracle/mysql/k8s/java/network/generic 全部判对。
-    - name: deepseek-free
-      base_url: "https://opencode.ai/zen/v1"
-      model: "deepseek-v4-flash-free"
+    # 两级分类器池：free 优先（local 轮询），free 全部 429/失败才降级到 go 付费（remote）。
+    # 实测基准（2026-08-12, 100题 7领域: java/oracle/mysql/k8s/linux/network/generic+日常/前端/科学）：
+    #   来源独立性: zen free 与 kilo free 额度互相独立（实测 kilo 连打不影响 zen，反之亦然）
+    #   poolside/laguna-s-2.1:free @kilo   稳定(连打5次全200, ~2s)   响应即准  ★free层首选
+    #   kilo-auto/free @kilo               95/100 (95%)              免key自动路由 ★free层
+    #   laguna-s-2.1-free @zen             200响应时100%命中           但503/限流频繁(free层补充)
+    #   deepseek-v4-flash @go              95/100 (95%)              付费, 永不限流 ★兜底
+    # 已淘汰: longcat-2.0-free(官方下线401) deepseek-v4-flash-free(持续429限流)
+    #   mimo-v2.5(53%, reasoning型content空) nemotron-3-ultra@kilo(响应>90s不稳定)
+    #   nemotron-3-super@kilo(36s+废话) stepfun/hy3/liquid(均reasoning型content空)
+    #   nemotron-3.5-lightning(长篇思考弃权) laguna-xs(429) hy3-free(429) ling-3.0-tiny(503)
+
+    # ---- local 层 (free 优先, 轮询, 来源分散避免同源全挂) ----
+    - name: kilo-laguna
+      base_url: "https://api.kilo.ai/api/openrouter"
+      model: "poolside/laguna-s-2.1:free"
       api_key_env: ""
       weight: 1.0
-    - name: longcat-free
-      base_url: "https://opencode.ai/zen/v1"
-      model: "longcat-2.0-free"
+      local: true
+      timeout: 30
+    - name: kilo-auto
+      base_url: "https://api.kilo.ai/api/openrouter"
+      model: "kilo-auto/free"
       api_key_env: ""
       weight: 1.0
-    - name: laguna-free
+      local: true
+      timeout: 6
+    - name: zen-laguna
       base_url: "https://opencode.ai/zen/v1"
       model: "laguna-s-2.1-free"
       api_key_env: ""
       weight: 1.0
-    # 无效模型（保留作记录，勿启用）：
-    # - mimo-v2.5-free / ling-3.0-tiny-free：聊天型，不遵守路由指令，输出长篇→弃权且浪费延迟
-    # - nemotron-3.5-lightning-free：所有输入都固定投 java（错投），会拉低 agreement
-  # 示例（混用本地 + 云端交叉验证）：
-  # classifiers:
-  #   - name: qwen-local          # 本地免费，免密钥
-  #     base_url: "http://127.0.0.1:11434/v1"
-  #     model: "qwen2.5:7b"
-  #     api_key_env: ""
-  #     weight: 1.0
-  #   - name: glm-local
-  #     base_url: "http://127.0.0.1:11434/v1"
-  #     model: "glm4:9b"
-  #     api_key_env: ""
-  #     weight: 1.0
-  #   - name: deepseek-cloud
-  #     base_url: "https://api.deepseek.com/v1"
-  #     model: "deepseek-chat"
-  #     api_key_env: "DEEPSEEK_API_KEY"
-  #     weight: 1.5               # 云端权重可设更高，平票时胜出
+      local: true
+      timeout: 30
+
+    # ---- go 付费层 (deepseek-v4-flash @go, 纳入 LLM 仲裁轮询池测试效果/消耗) ----
+    - name: go-ds-flash
+      base_url: "https://opencode.ai/zen/go/v1"
+      model: "deepseek-v4-flash"
+      api_key_env: "OPENCODE_GO_API_KEY"
+      weight: 1.0
+      local: true
+      timeout: 30
+      # 示例（混用本地 + 云端交叉验证）：
+      # classifiers:
+      #   - name: qwen-local          # 本地免费，免密钥
+      #     base_url: "http://127.0.0.1:11434/v1"
+      #     model: "qwen2.5:7b"
+      #     api_key_env: ""
+      #     weight: 1.0
+      #   - name: glm-local
+      #     base_url: "http://127.0.0.1:11434/v1"
+      #     model: "glm4:9b"
+      #     api_key_env: ""
+      #     weight: 1.0
+      #   - name: deepseek-cloud
+      #     base_url: "https://api.deepseek.com/v1"
+      #     model: "deepseek-chat"
+      #     api_key_env: "DEEPSEEK_API_KEY"
+      #     weight: 1.5               # 云端权重可设更高，平票时胜出
 
   anchor_prompt: |
     [项目家风 - 状态优先行动协议]（最高优先级，覆盖其他所有规则）

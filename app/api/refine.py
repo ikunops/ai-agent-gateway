@@ -88,13 +88,16 @@ async def refine(
         if k in rm:
             meta[k] = rm[k]
 
+    refined_payload = {
+        k: v
+        for k, v in payload_in.items()
+        if k not in ("model", "messages", "stream")
+    }
+    refined_payload["model"] = payload_in.get("model")
+    refined_payload["messages"] = result["messages"]
+
     return {
         "request_id": request_id,
-        "refined": {
-            "model": payload_in.get("model"),
-            "messages": result["messages"],
-            "temperature": payload_in.get("temperature", 1.0),
-            "max_tokens": payload_in.get("max_tokens"),
-        },
+        "refined": refined_payload,
         "meta": meta,
     }

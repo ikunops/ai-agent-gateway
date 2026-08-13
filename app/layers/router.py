@@ -227,8 +227,6 @@ class SemanticRouter:
         terms / segments / vector_scores / best_segment / digest_len /
         fidelity_forced / vector_latency_ms / judge_latency_ms"""
         key_src = text
-        if context.strip():
-            key_src = f"{text}\n<ctx>{context[-800:]}</ctx>"
         key = hashlib.sha256(key_src.encode("utf-8")).hexdigest()
 
         terms = extract_tech_terms(text)

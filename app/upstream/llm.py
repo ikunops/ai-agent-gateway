@@ -33,7 +33,7 @@ class UpstreamClient:
             write=WRITE_TIMEOUT,
             pool=30.0,
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, proxy=None) as client:
             try:
                 async with client.stream("POST", url, json=body, headers=self._headers()) as resp:
                     if resp.status_code >= 400:

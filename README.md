@@ -77,17 +77,17 @@ Agent 与 LLM 之间的路由导航层：不思考、不记忆、不执行，只
 pip install -r requirements.txt
 
 # 2. 启动（默认纯整形模式：零上游依赖、零模型 key）
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8080
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8901
 
 # 3. 验证
-curl http://127.0.0.1:8080/v1/health
+curl http://127.0.0.1:8901/v1/health
 ```
 
 ## 对接 opencodego
 
 ```bash
 # 1. 调 /v1/refine 拿增强后的请求
-curl -X POST http://127.0.0.1:8080/v1/refine \
+curl -X POST http://127.0.0.1:8901/v1/refine \
   -H "X-API-Key: gateway-dev-key" \
   -H "X-Project-Id: myproj" -H "X-Session-Id: sess1" \
   -d '{"messages": [{"role": "user", "content": "开发一个手机清理工具"}], "model": "用户当前模型"}'
@@ -97,6 +97,16 @@ curl -X POST http://127.0.0.1:8080/v1/refine \
 ```
 
 响应示意：`refined.messages`（含网关构造的 System 前缀）+ `meta`（路由标签/Tier/澄清模式/保真统计）。
+
+## 相关组件
+
+### go-cache-proxy（用户 dotfiles 里的缓存代理，端口 8787）— 暂不改动，仅记录
+
+- 位置：`~/.config/opencode/scripts/go-cache-proxy/`（仓库：ikunops/opencode-dotfiles）
+- 职责：**纯缓存**，置于 opencode 与 OpenCode Go 之间，相同请求体命中本地缓存直接返回，省 Go 配额；流式透传同时缓冲；`/__stats` 看命中统计。
+- 与网关的关系：它"递话"但**不做整形**；本网关做整形+路由，二者职责互补但当前独立运行。
+- 曾作为 `opencode-go` provider（8787）被 opencode 引用，2026-08-12 因与 gateway provider 冲突（请求发到未运行的 8787）被移除，统一走本网关 8901。
+- 后续可选整合方向（暂缓）：把 go-cache-proxy 接到网关下游做两级缓存，或直接复用网关自带精确缓存。
 
 ## API 一览
 

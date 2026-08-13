@@ -29,3 +29,34 @@ def test_routing_ledger_empty(tmp_path):
     assert s["records"] == 0
     assert s["by_source"] == {}
     assert s["avg_score"] == 0.0
+
+
+def test_routing_ledger_classifier_usage(tmp_path):
+    ledger = RoutingLedger(str(tmp_path))
+    ledger.log({
+        "source": "llm", "route": "oracle", "tier": 1, "terms": [],
+        "score": 1.0, "judge_latency_ms": 300,
+        "classifier_stage": "local:a",
+        "classifier_calls": [
+            {"name": "a", "ok": True, "vote": "oracle", "latency_ms": 300},
+        ],
+    })
+    ledger.log({
+        "source": "llm", "route": "mysql", "tier": 1, "terms": [],
+        "score": 1.0, "judge_latency_ms": 200,
+        "classifier_stage": "local:b",
+        "classifier_calls": [
+            {"name": "a", "ok": False, "latency_ms": 100},
+            {"name": "b", "ok": True, "vote": "mysql", "latency_ms": 200},
+        ],
+    })
+    s = ledger.summarize()
+    assert s["by_classifier"]["a"] == {
+        "calls": 2, "ok": 1, "failed": 1, "fail_rate": 0.5,
+        "avg_latency_ms": 200.0,
+        "votes": {"oracle": 1},
+        "stages": {"local:a": 1, "local:b": 1},
+    }
+    assert s["by_classifier"]["b"]["calls"] == 1
+    assert s["by_classifier"]["b"]["ok"] == 1
+    assert s["by_classifier"]["b"]["votes"] == {"mysql": 1}

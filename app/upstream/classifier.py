@@ -6,11 +6,16 @@
 """
 
 import asyncio
+import itertools
 import re
 import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
+
+
+def _is_local(base_url: str) -> bool:
+    return "127.0.0.1" in base_url or "localhost" in base_url
 
 
 class ClassifierClient:
@@ -24,6 +29,7 @@ class ClassifierClient:
         model: str = "qwen2.5:7b",
         weight: float = 1.0,
         timeout: float = 30.0,
+        local: Optional[bool] = None,
     ):
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -31,6 +37,7 @@ class ClassifierClient:
         self.model = model
         self.weight = weight
         self.timeout = timeout
+        self.local = _is_local(self.base_url) if local is None else local
 
     async def judge(
         self, text: str, route_names: List[str], context: str = ""
@@ -80,7 +87,7 @@ class ClassifierClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         t0 = time.time()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout), proxy=None) as client:
                 resp = await client.post(
                     f"{self.base_url}/chat/completions", json=payload, headers=headers
                 )
@@ -108,16 +115,21 @@ class ClassifierClient:
 
 
 class ClassifierEnsemble:
-    """多分类器交叉验证：并发调用全部配置的分类器，按加权票选路线。
+    """多分类器交叉验证：两阶段调度 + 本地轮询。
 
-    - 全部一致 → 该路线，agreement = 1.0
-    - 不一致 → 加权票数最高者胜出，agreement = 得票权重占比（路由得分随一致性下降）
-    - 全部失败 → None，调用方自然降级（技术词/向量路径不受影响）
-    - 单分类器也可以直接用 ClassifierClient，无需 Ensemble
+    - 阶段一（本地优先，轮询）：从 local 分类器池按 round-robin 挑选 1 个调用，
+      成功后按单分类器结果出票；失败则轮询下一个本地分类器，直至本池耗尽。
+      （避免并发等待多个模型，单次仲裁延迟 = 单个模型的延迟。）
+    - 阶段二（远程降级）：按配置顺序逐个尝试 remote 分类器，只取第一个成功者。
+    - 全部失败 → None，调用方自然降级（技术词/向量路径不受影响）。
+    - 单分类器也可以直接用 ClassifierClient，无需 Ensemble。
     """
 
     def __init__(self, classifiers: List[ClassifierClient]):
         self.classifiers = classifiers
+        self.local_clients = [c for c in classifiers if c.local]
+        self.remote_clients = [c for c in classifiers if not c.local]
+        self._rr = itertools.cycle(self.local_clients) if self.local_clients else itertools.cycle([])
 
     @property
     def total_weight(self) -> float:
@@ -132,34 +144,66 @@ class ClassifierEnsemble:
         name, _ = result
         return name
 
-    async def judge_detailed(
-        self, text: str, route_names: List[str], context: str = ""
-    ) -> Optional[Tuple[str, Dict]]:
-        """返回 (route_name, {votes, per_classifier, agreement})。"""
-        if not self.classifiers or not route_names:
-            return None
-        results = await asyncio.gather(
-            *(c.judge_detailed(text, route_names, context) for c in self.classifiers),
-            return_exceptions=True,
-        )
-        votes: Dict[str, float] = {}
-        per: List[Dict] = []
-        for c, r in zip(self.classifiers, results):
-            if isinstance(r, Exception) or r is None:
-                per.append({"name": c.name, "ok": False, "vote": None})
-                continue
-            name, detail = r
-            votes[name] = votes.get(name, 0.0) + c.weight
-            per.append({
-                "name": c.name, "ok": True, "vote": name,
-                "latency_ms": detail.get("latency_ms", 0),
-            })
-        if not votes:
-            return None, {"votes": {}, "per_classifier": per, "agreement": 0.0}
+    def _finalize(self, votes: Dict[str, float], per: List[Dict], stage: str) -> Tuple[str, Dict]:
         best = max(votes, key=votes.get)
+        if len(votes) == 1:
+            agreement = 1.0
+        else:
+            agreement = round(votes[best] / self.total_weight, 3)
         meta = {
             "votes": {k: round(v, 3) for k, v in votes.items()},
             "per_classifier": per,
-            "agreement": round(votes[best] / self.total_weight, 3),
+            "agreement": agreement,
+            "stage": stage,
         }
         return best, meta
+
+    async def judge_detailed(
+        self, text: str, route_names: List[str], context: str = ""
+    ) -> Optional[Tuple[str, Dict]]:
+        """返回 (route_name, {votes, per_classifier, agreement, stage})。"""
+        if not self.classifiers or not route_names:
+            return None
+
+        per: List[Dict] = []
+
+        if self.local_clients:
+            tried = set()
+            for _ in range(len(self.local_clients)):
+                c = next(self._rr)
+                if c.name in tried:
+                    continue
+                tried.add(c.name)
+                try:
+                    r = await c.judge_detailed(text, route_names, context)
+                except Exception:
+                    r = None
+                if r is None:
+                    per.append({"name": c.name, "ok": False, "vote": None})
+                    continue
+                name, detail = r
+                per.append({
+                    "name": c.name, "ok": True, "vote": name,
+                    "latency_ms": detail.get("latency_ms", 0),
+                })
+                return self._finalize({name: c.weight}, per, stage=f"local:{c.name}")
+
+        if self.remote_clients:
+            for c in self.remote_clients:
+                try:
+                    r = await c.judge_detailed(text, route_names, context)
+                except Exception:
+                    r = None
+                if r is None:
+                    per.append({"name": c.name, "ok": False, "vote": None})
+                    continue
+                name, detail = r
+                per.append({
+                    "name": c.name, "ok": True, "vote": name,
+                    "latency_ms": detail.get("latency_ms", 0),
+                })
+                return self._finalize({name: c.weight}, per, stage="remote")
+
+        if not per:
+            return None, {"votes": {}, "per_classifier": [], "agreement": 0.0, "stage": "none"}
+        return None, {"votes": {}, "per_classifier": per, "agreement": 0.0, "stage": "none"}

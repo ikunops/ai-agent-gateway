@@ -62,7 +62,7 @@ async def process_request(
             for m in cleaned[-6:-1]
             if isinstance(m.get("content"), str)
         )
-        judge = llm_router.judge if llm_router is not None else None
+        judge = llm_router.judge_detailed if llm_router is not None else None
         route_name, route_score, route_source, route_meta = await router.route_detailed(
             user_text, llm_judge=judge, context=context_text
         )
@@ -105,6 +105,8 @@ async def process_request(
         "vector_scores": route_meta.get("vector_scores", {}),
         "votes": route_meta.get("vote", {}).get("votes", {}),
         "agreement": route_meta.get("vote", {}).get("agreement", 0),
+        "classifier_stage": route_meta.get("vote", {}).get("stage", ""),
+        "classifier_calls": route_meta.get("vote", {}).get("per_classifier", []),
         "perm_action": permission["action"],
         "perm_matched": [m["label"] for m in permission.get("matched", [])],
     })

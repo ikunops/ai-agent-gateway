@@ -145,6 +145,8 @@ def build_sse_chunks(cached: Dict) -> List[Dict]:
     choices = cached.get("choices") or []
     message = choices[0].get("message", {}) if choices else {}
     content = message.get("content") or ""
+    tool_calls = message.get("tool_calls") or []
+    finish_reason = (choices[0].get("finish_reason") or "stop") if choices else "stop"
     created = int(cached.get("created", time.time()))
     cid = cached.get("id", "chatcmpl-cache")
     model = cached.get("model", "")
@@ -159,9 +161,20 @@ def build_sse_chunks(cached: Dict) -> List[Dict]:
             "choices": [{"index": 0, "delta": {"content": content[i:i + _SSE_CHUNK_CHARS]},
                          "finish_reason": None}],
         })
+    for idx, tc in enumerate(tool_calls):
+        fn = tc.get("function") or {}
+        chunks.append({
+            "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": idx,
+                "id": tc.get("id", f"call_{idx}"),
+                "type": tc.get("type", "function"),
+                "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")},
+            }]}, "finish_reason": None}],
+        })
     chunks.append({
         "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
     })
     return chunks
 

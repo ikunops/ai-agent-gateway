@@ -44,7 +44,7 @@ class LocalDigestPicker:
             f"{lines}"
         )
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, proxy=None) as client:
                 resp = await client.post(
                     f"{self.base_url}/api/generate",
                     json={
