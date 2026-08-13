@@ -39,6 +39,7 @@
 - 暂空
 - [运维经验]：AGENTS.md 区块维护走 sculpt.py（init/status/propose/approve），禁止手改已生效区（使用条件：仅限 opencode 管理的项目；证据：2026-08-13 接入项目记忆雕刻师 skill 并完成初始化）
 - [gateway]：网关转发必须透传请求全部字段(tools/tool_choice/stream_options 等),禁止白名单只传 model/messages/temperature/max_tokens;opencode 与 zen/go 的 deepseek 系模型走 DSML 协议而非标准 OpenAI tools,透传被破坏=工具调用哑火（使用条件：仅限 ai-agent-gateway 项目转发模式(/v1/chat/completions);纯整形模式(/v1/refine)不受影响；证据：2026-08-13 实测:网关旧代码白名单丢失 tools 后 ds 哑火;透传修复后当前会话(gateway/deepseek-v4-flash)工具调用正常;裸测标准 OpenAI tools 格式 ds 不产 tool_calls,但 opencode 走 DSML 正常;137 pytest 全过）
+- [运维约束]：停止/重启网关(8901)前必须先切直连(/models 选 opencode/*), 禁止未切换直接 kill 网关进程（使用条件：仅限 ai-agent-gateway 项目运维；证据：2026-08-14 清理 go-cache-proxy 时未先切换导致 opencode 会话中断）
 ## [待确认]
 
 - 暂空
