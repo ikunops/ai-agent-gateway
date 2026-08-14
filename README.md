@@ -1,196 +1,126 @@
-# AI Gateway
+<!-- SEO keywords: AI网关, 大模型网关, LLM路由, OpenAI兼容代理, 智能路由, 模型网关, AI中间件, Agent网关 -->
+# AI Gateway — The Routing & Navigation Layer Between Agents and LLMs
 
-Agent 与 LLM 之间的路由导航层：不思考、不记忆、不执行，只负责"用户会话进来 → 交给大模型之前"这一段——清洗、上下文、路由、System 构造、命中率提升。
+**AI Gateway（AI 网关）** is a routing/navigation layer between AI agents and large language models (LLM). It does **not** think, remember, or execute — it only handles the stretch between "a user session arrives" and "the request is handed to a model": request cleaning, context, routing, System-prompt construction, and cache-hit-rate optimization.
 
-**主形态是纯整形**：网关不持有任何模型 key、不选模型、不替模型回复。`POST /v1/refine` 返回"增强后的请求"，由 Agent 侧（opencodego）转发给用户当前选择的模型。
+[English](README.md) | [中文](README.zh.md)
 
-> 状态：Phase 1 + Phase 2 已完成（纯整形 refine + 前缀稳定化 + 精确缓存 + 四层降级 + 项目感知 + 统计审计 + 路由明细账）
-> 详细架构设计见 [docs/architecture.md](docs/architecture.md)
+> **Status**: Phase 1–3 complete, Phase 4 partially complete (permission tiers + routing ledger). 137 tests passing.
+> Detailed architecture: [docs/architecture.md](docs/architecture.md)
 
-## 定位
+## What It Does
 
-```
-┌─────────────┐   原始请求   ┌──────────────┐   增强后的请求    ┌──────────────┐
-│  Agent 侧   │ ──────────► │  AI Gateway  │ ──────────────► │  Agent 侧     │
-│ (opencodego)│             │  (本项目)     │   refined.messages│ (同侧转发)    │
-└─────────────┘             └──────────────┘                  └──────┬───────┘
-                                                                    │ 用户当前选择的模型
-                                                                    ▼
-                                                             goapi / 任何模型
-```
+- **Transparent proxy mode (primary, in use)** — `POST /v1/chat/completions`: routes by model name to the matching upstream (`config.yaml` ships with `zen-go` / `zen-free` pools), applies request enhancement + permission gating + response caching, then forwards with **full field passthrough** (`tools` / `tool_choice` / `stream_options` etc.) — no whitelist trimming.
+- **Refine mode (alternate)** — `POST /v1/refine`: returns an "enhanced request" (`refined.messages`) plus routing metadata (`meta`), which the agent side forwards to whatever model the user currently selected.
+- **No model keys held by the gateway** — models are chosen on the agent side; the gateway is model-agnostic.
+- **Classifier pool (round-robin)** — `gateway.classifiers` hits the local pool one classifier at a time (first success wins, with failover), falling back to a remote classifier only if all local ones fail; if none are configured it uses pure local rule routing. See `app/upstream/classifier.py`.
 
-- **网关不持有模型 key**：模型由用户在 Agent 侧切换，网关无感知、不绑定
-- **主端点 `POST /v1/refine`**：请求整形，零模型依赖；转发模式（配了 `upstream.base_url`）可选
-- **多分类器交叉验证（可选）**：`gateway.classifiers` 由你自定任意 OpenAI 兼容端点（Ollama 免费本地 / DeepSeek / 中转站），网关并发调用 + 加权投票，`agreement` 作为路由得分；不配则纯本地规则路由
-
-## 总体架构
+## Architecture
 
 ```
 ┌─────────────┐
-│   Agent     │ opencode / 其他
+│   Agent     │ opencode / other
 └──────┬──────┘
        │ POST /v1/chat/completions
        ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                        AI Gateway                              │
 │                                                                │
-│  L1 预处理 ──► 精确缓存 ──► L2 决策路由 ──► L3 缓存降级 ──► L4 System构造 ──► L5 出口
-│  鉴权/限流      (请求hash)    三路仲裁(预留)   四层匹配        前缀稳定化       转发/统计/审计
-│  清洗/归一化    HIT直接返回   向量+KB+LLM     Tier1-4         动态杂质下沉
-│  会话/项目解析                                项目ID/会话ID
+│  L1 Preprocess ──► Exact Cache ──► L2 Routing ──► L3 Cache     │
+│  auth/clean     (request hash)    tri-route     Tier1-4        │
+│  session/       HIT → return      vector+KB+    project/       │
+│  project parse                     LLM          session ID     │
 │                                                                │
+│  L4 System Build ──► L5 Egress                                  │
+│  prefix stable     forward / stats / audit                      │
 └────────────────────────────────────┬───────────────────────────┘
-                                     │ 转发
+                                     │ forward
                                      ▼
-                              DeepSeek / 其他模型
+                          DeepSeek / any upstream model
 ```
 
-### 请求处理流水线
+### Request Pipeline
 
-1. **L1 预处理**：API Key 鉴权 → 文本归一化（换行/空格/异常字符）→ 解析 `X-Project-Id` / `X-Session-Id`
-2. **精确缓存检查**：请求体 hash 命中 → 直接返回缓存（流式/非流式共享，SSE 合成），零上游消耗
-3. **L2 决策路由**：三路并行仲裁（技术词快路径 + 语义向量 + 轻量 LLM 分类），长文本分段取 max（墙式文本按句子二次切分，向量最佳段并入摘要），决定模型选择与 System 前缀来源；模糊开发需求（如"开发一个手机清理工具"）跳过路由直接进入**需求澄清模式**（每会话一轮，注入澄清问题到 User 尾部）；路由摘要走**保真契约**（抽取式选段 + 否定词/连接词/符号段强制保留 + 幻觉校验），可插拔本地免费模型（Ollama，`digest.local_picker`，默认关闭）；每次路由决策写入 **Routing Ledger**（`/v1/stats/routing` 查看聚合，运行后据此调优）
-4. **L3 四层缓存降级**（永不落空）：
-   | Tier | 来源 | Key |
+1. **L1 Preprocess**: API-key auth → text normalization → parse `X-Project-Id` / `X-Session-Id`
+2. **Exact cache**: request-body hash hit → return cached response directly (stream/non-stream share, SSE assembled) — zero upstream cost
+3. **L2 Routing**: tri-route arbitration (technical-term fast path + semantic vector + lightweight LLM classifier), long-text segmented with max aggregation; ambiguous dev requests ("build a phone cleaner") skip routing into **clarification mode** (one round per session, question injected at the tail of the user message); routing summaries follow a **fidelity contract** (extractive, negative/conjunction/symbol segments forced-kept, hallucination-checked); every decision writes to the **Routing Ledger** (aggregate at `/v1/stats/routing`)
+4. **L3 Four-tier cache fallback (never misses)**:
+   | Tier | Source | Key |
    |---|---|---|
-   | Tier1 | 全球技术栈通用规范 | 路由标签（如 java/mysql/k8s） |
-   | Tier2 | 项目 AGENTS.md（注册表映射） | project_id |
-   | Tier3 | 会话摘要（每轮回填） | session_id |
-   | Tier4 | 空 System 兜底 | - |
-5. **L4 System 构造（前缀稳定化）**：System 只放稳定内容（锚点协议 + Tier 命中产物 + 路由上下文），时间戳/随机数等动态杂质自动下沉到 User 尾部 → 模型侧 prompt 缓存命中率提升
-6. **L5 出口**：流式/非流式转发 → 缓冲回填精确缓存 → 会话摘要回填 Tier3 → 统计 + 审计落盘
+   | Tier1 | global tech-stack common rules | routing tag (e.g. java/mysql/k8s) |
+   | Tier2 | project AGENTS.md (registry mapping) | project_id |
+   | Tier3 | session summary (backfilled each round) | session_id |
+   | Tier4 | empty System fallback | - |
+5. **L4 System construction (prefix stabilization)**: System holds only stable content (anchor protocol + tier-hit product + routing context); dynamic noise (timestamps/random numbers) sinks to the tail of the user message → higher model-side prompt-cache hit rate
+6. **L5 Egress**: stream/non-stream forward → buffer backfill exact cache → session-summary backfill Tier3 → stats + audit to disk
 
-### 状态优先行动协议
-
-锚点随 System 自动注入（Tier2 家风命中即生效），对所有项目永久生效：
-
-- **状态优先**：任何任务第一步必须用只读工具获取状态，禁止不侦察就下结论或拒绝
-- **拒绝前自查**：说"不能/做不到/需要登录"之前必须先只读自查并附证据，拒绝是最后手段
-- **行动前自查**：写/删/改/重启前自检影响范围、可逆性、环境隔离
-
-完整协议与安全红线见 `config.yaml` 的 `gateway.anchor_prompt`。
-
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 安装依赖
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. 启动（默认纯整形模式：零上游依赖、零模型 key）
+# 2. Start (default forwarding mode: opencode Zen free endpoint, no key needed)
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8901
 
-# 3. 验证
+# 3. Verify
 curl http://127.0.0.1:8901/v1/health
 ```
 
-## 对接 opencodego
+On Windows you can also use the helper script:
+
+```powershell
+scripts\gateway.ps1 start|stop|restart|status
+```
+
+## Connecting opencode
 
 ```bash
-# 1. 调 /v1/refine 拿增强后的请求
-curl -X POST http://127.0.0.1:8901/v1/refine \
+# Use /v1/chat/completions directly (forwarding mode)
+curl -X POST http://127.0.0.1:8901/v1/chat/completions \
   -H "X-API-Key: gateway-dev-key" \
   -H "X-Project-Id: myproj" -H "X-Session-Id: sess1" \
-  -d '{"messages": [{"role": "user", "content": "开发一个手机清理工具"}], "model": "用户当前模型"}'
+  -d '{"messages": [{"role": "user", "content": "build a phone cleaner"}], "model": "deepseek-v4-flash"}'
 
-# 2. 把响应里的 refined.messages 原样转发给用户当前选择的模型
-#    （模型切换完全在 Agent 侧，网关无感知）
+# Or /v1/refine to get an enhanced request + routing metadata,
+# then forward refined.messages to your currently-selected model.
 ```
 
-响应示意：`refined.messages`（含网关构造的 System 前缀）+ `meta`（路由标签/Tier/澄清模式/保真统计）。
+Response shape: `refined.messages` (includes the gateway-built System prefix) + `meta` (routing tag / tier / clarification mode / fidelity stats).
 
-## 相关组件
+## API Overview
 
-### go-cache-proxy（用户 dotfiles 里的缓存代理，端口 8787）— 暂不改动，仅记录
-
-- 位置：`~/.config/opencode/scripts/go-cache-proxy/`（仓库：ikunops/opencode-dotfiles）
-- 职责：**纯缓存**，置于 opencode 与 OpenCode Go 之间，相同请求体命中本地缓存直接返回，省 Go 配额；流式透传同时缓冲；`/__stats` 看命中统计。
-- 与网关的关系：它"递话"但**不做整形**；本网关做整形+路由，二者职责互补但当前独立运行。
-- 曾作为 `opencode-go` provider（8787）被 opencode 引用，2026-08-12 因与 gateway provider 冲突（请求发到未运行的 8787）被移除，统一走本网关 8901。
-- 后续可选整合方向（暂缓）：把 go-cache-proxy 接到网关下游做两级缓存，或直接复用网关自带精确缓存。
-
-## API 一览
-
-| 端点 | 方法 | 说明 |
+| Endpoint | Method | Description |
 |---|---|---|
-| `/v1/refine` | POST | ★主端点：请求整形（清洗/路由/System 构造），零模型依赖，返回增强请求+路由元信息 |
-| `/v1/chat/completions` | POST | 可选转发模式（需配置 `upstream.base_url`，OpenAI 兼容，流式+非流式） |
-| `/v1/models` | GET | 模型列表（整形模式返回空） |
-| `/v1/health` | GET | 健康检查 |
-| `/v1/projects` | POST | 注册项目（绑定 project_id → AGENTS.md 路径） |
-| `/v1/projects` | GET | 项目列表 |
-| `/v1/projects/{id}` | DELETE | 注销项目 |
-| `/v1/cache/clear` | POST | 清空精确响应缓存 |
-| `/v1/stats/hits` | GET | 统计（精确缓存命中率 + 前缀重叠 + Tier 分布） |
-| `/v1/stats/routing` | GET | 路由决策明细账摘要（来源/标签/Tier 分布 + 高频技术词 + 平均延迟，调优入口） |
+| `/v1/refine` | POST | Refine: request shaping (clean/route/System build), zero model dependency |
+| `/v1/chat/completions` | POST | Transparent proxy (configurable upstreams, OpenAI-compatible, stream + non-stream) |
+| `/v1/models` | GET | Model list |
+| `/v1/health` | GET | Health check |
+| `/v1/projects` | POST/GET | Register / list projects (project_id → AGENTS.md path) |
+| `/v1/projects/{id}` | DELETE | Unregister project |
+| `/v1/cache/clear` | POST | Clear exact response cache |
+| `/v1/stats/hits` | GET | Cache hit rate + prefix overlap + tier distribution |
+| `/v1/stats/routing` | GET | Routing ledger summary (source/tag/tier + top tech terms + avg latency) |
 
-请求头：`X-API-Key`（鉴权，必填）、`X-Project-Id`、`X-Session-Id`（缓存 Key）。
+Headers: `X-API-Key` (auth, required), `X-Project-Id`, `X-Session-Id` (cache keys).
 
-## 配置（config.yaml）
-
-```yaml
-auth:
-  api_keys:
-    default: "gateway-dev-key"      # 网关鉴权密钥
-
-upstream:
-  default:
-    base_url: "https://api.deepseek.com/v1"
-    api_key_env: "DEEPSEEK_API_KEY" # 从环境变量读取上游密钥
-    default_model: "deepseek-chat"
-
-gateway:
-  anchor_prompt: "..."              # 状态优先行动协议 + 安全红线锚点
-
-data:
-  dir: "data"                       # 注册表 + 响应缓存持久化目录
-
-audit:
-  dir: "logs"                       # 审计 JSONL 落盘目录
-  keep_days: 30
-```
-
-## 测试
+## Tests
 
 ```bash
 python -m pytest tests -q
 ```
 
-覆盖：清洗、前缀稳定化、动态杂质下沉、四层缓存降级、精确缓存（含流式/非流式共享命中）、SSE 合成、项目注册表持久化、鉴权、统计审计、模糊需求澄清模式（含 one-shot）、长文本分段路由（技术词快路径/逐段向量/路由摘要/句子切分/保真闸门/本地抽取模型）、路由决策明细账（Routing Ledger）。当前 **94 个测试全部通过**。
+Covers: cleaning, prefix stabilization, dynamic-noise sinking, four-tier cache fallback, exact cache (stream/non-stream shared hit), SSE assembly, project registry persistence, auth, stats/audit, clarification mode (one-shot), long-text segmented routing, and Routing Ledger. **137 tests passing.**
 
-## 目录结构
+## Roadmap
 
-```
-ai-gateway/
-├── app/
-│   ├── main.py                 # FastAPI 入口 + 管理端点
-│   ├── api/
-│   │   └── chat.py             # /v1/chat/completions 主代理管线
-│   ├── core/
-│   │   └── config.py           # 配置加载（yaml + 环境变量）
-│   ├── layers/
-│   │   ├── preprocess.py       # L1 清洗 / 鉴权 / 会话解析
-│   │   ├── text_analysis.py    # 分段（含句子切分）/ 技术词提取 / 路由摘要 / 保真闸门
-│   │   ├── system_builder.py   # L4 前缀稳定化 / 动态杂质下沉 / 模糊需求检测
-│   │   ├── cache.py            # L3 四层降级 / 技术栈标签提取 / 澄清 one-shot
-│   │   ├── registry.py         # 项目注册表（project_id → AGENTS.md）
-│   │   ├── response_cache.py   # 精确响应缓存 / SSE 合成 / 费用估算
-│   │   ├── routing_log.py      # 路由决策明细账（每日 JSONL + 聚合摘要）
-│   │   └── stats.py            # 统计 / 审计
-│   └── upstream/
-│       └── llm.py              # 上游转发（流式 + 非流式）
-├── tests/                      # 94 个测试
-├── docs/
-│   └── architecture.md         # 完整架构设计文档
-├── config.yaml
-├── requirements.txt
-└── AGENTS.md                   # 本项目家风（状态优先行动协议）
-```
-
-## 路线图
-
-| Phase | 内容 | 状态 |
+| Phase | Scope | Status |
 |---|---|---|
-| Phase 1 | OpenAI 兼容转发 + 鉴权 + 状态优先协议注入 + 会话管理 | ✅ 完成 |
-| Phase 2 | 精确缓存 + 四层降级 + 前缀稳定化 + 项目注册 + 会话摘要回填 | ✅ 完成 |
-| Phase 3 | 三路路由仲裁（向量 + 知识库 + 轻量 LLM）+ 轻重模型选择 | ⏳ 计划 |
-| Phase 4 | 权限分级 L0/L1/L2 + 出口危险拦截 | ⏳ 计划 |
+| Phase 1 | OpenAI-compatible forwarding + auth + state-first protocol injection + session mgmt | ✅ done |
+| Phase 2 | Exact cache + four-tier fallback + prefix stabilization + project registry + session-summary backfill | ✅ done |
+| Phase 3 | Tri-route arbitration (vector + KB + lightweight LLM) + heavy/light model selection | ✅ done |
+| Phase 4 | Permission tiers L0/L1/L2 + egress danger interception | 🟡 partial (stats/audit/project registration done, rate limiting pending) |
+
+---
+
+Built with Python 3.11 + FastAPI. License: see repo. Contributions welcome.
